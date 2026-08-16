@@ -318,8 +318,9 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
 
         # Call model
         noisy_model_input = noisy_model_input.unsqueeze(2)  # 4D to 5D, [B, C, H, W] -> [B, C, 1, H, W]
+        empty_prompt_embeds = torch.zeros_like(prompt_embeds)
         with torch.set_grad_enabled(is_train), accelerator.autocast():
-            model_pred = anima(
+            pred_cond = anima(
                 noisy_model_input,
                 timesteps,
                 prompt_embeds,
@@ -328,6 +329,16 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                 target_attention_mask=t5_attn_mask,
                 source_attention_mask=attn_mask,
             )
+            pred_uncond = anima(
+                noisy_model_input,
+                timesteps,
+                empty_prompt_embeds,
+                padding_mask=padding_mask,
+                target_input_ids=t5_input_ids,
+                target_attention_mask=t5_attn_mask,
+                source_attention_mask=attn_mask,
+            )
+            model_pred = pred_uncond + args.anima_training_cfg * (pred_cond - pred_uncond)
         model_pred = model_pred.squeeze(2)  # 5D to 4D, [B, C, 1, H, W] -> [B, C, H, W]
 
         # Rectified flow target: noise - latents

@@ -17,6 +17,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from PIL import Image
 
 from library import (
+    anima_er_sde_sampling,
     anima_models,
     anima_train_utils,
     anima_utils,
@@ -75,6 +76,15 @@ def parse_args() -> argparse.Namespace:
     # LoRA
     parser.add_argument("--lora_weight", type=str, nargs="*", required=False, default=None, help="LoRA weight path")
     parser.add_argument("--lora_multiplier", type=float, nargs="*", default=1.0, help="LoRA multiplier")
+    parser.add_argument(
+        "--lora_list",
+        type=str,
+        nargs="*",
+        default=None,
+        help="Inline list of LoRAs as a flat sequence of '<path> <multiplier>' tokens (multiplier optional, "
+        "default 1.0). Use shell line-continuation to put one 'path multiplier' per line. Populates "
+        "--lora_weight/--lora_multiplier.",
+    )
     parser.add_argument("--include_patterns", type=str, nargs="*", default=None, help="LoRA module include patterns")
     parser.add_argument("--exclude_patterns", type=str, nargs="*", default=None, help="LoRA module exclude patterns")
 
@@ -117,6 +127,20 @@ def parse_args() -> argparse.Namespace:
         default="images",
         choices=["images", "latent", "latent_images"],
         help="output type",
+    )
+    parser.add_argument(
+        "--sampler",
+        type=str,
+        default="euler",
+        choices=["euler", "er_sde"],
+        help="sampler: euler (deterministic flow Euler, default) or er_sde (stochastic ER-SDE-Solver-3, Anima's recommended sampler)",
+    )
+    parser.add_argument(
+        "--scheduler",
+        type=str,
+        default="default",
+        choices=["default", "beta57"],
+        help="sigma scheduler: default (flow-shifted linspace) or beta57 (RES4LYF beta alpha=0.5/beta=0.7, more low-noise emphasis)",
     )
     parser.add_argument("--no_metadata", action="store_true", help="do not save metadata")
     parser.add_argument("--latent_path", type=str, nargs="*", default=None, help="path to latent for decode. no inference")
@@ -561,31 +585,41 @@ def generate_body(
     embed = embed.to(torch.bfloat16)
     negative_embed = negative_embed.to(torch.bfloat16)
 
-    # Prepare timesteps
-    timesteps, sigmas = hunyuan_image_utils.get_timesteps_sigmas(args.infer_steps, args.flow_shift, device)
-    timesteps /= 1000  # scale to [0,1] range
-    timesteps = timesteps.to(device, dtype=torch.bfloat16)
+    # Prepare sigmas according to the selected scheduler (flow sigmas in [0,1], descending to 0)
+    if args.scheduler == "beta57":
+        sigmas = anima_er_sde_sampling.build_beta57_sigmas(args.infer_steps, args.flow_shift, device)
+    else:
+        _timesteps, sigmas = hunyuan_image_utils.get_timesteps_sigmas(args.infer_steps, args.flow_shift, device)
 
-    # Denoising loop
     do_cfg = args.guidance_scale != 1.0
     autocast_enabled = args.fp8
 
-    with tqdm(total=len(timesteps), desc="Denoising steps") as pbar:
-        for i, t in enumerate(timesteps):
-            t_expand = t.expand(latents.shape[0])
-
+    def run_velocity_with_cfg(current_latents, sigma_scalar):
+        # The Anima DiT consumes the flow sigma (in [0,1]) directly as its time input.
+        time_input = sigma_scalar.to(device=device, dtype=torch.bfloat16).expand(current_latents.shape[0])
+        model_input = current_latents.to(torch.bfloat16)
+        with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
+            velocity = anima(model_input, time_input, embed, padding_mask=padding_mask)
+        if do_cfg:
             with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
-                noise_pred = anima(latents, t_expand, embed, padding_mask=padding_mask)
+                uncond_velocity = anima(model_input, time_input, negative_embed, padding_mask=padding_mask)
+            velocity = uncond_velocity + args.guidance_scale * (velocity - uncond_velocity)
+        return velocity
 
-            if do_cfg:
-                with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
-                    uncond_noise_pred = anima(latents, t_expand, negative_embed, padding_mask=padding_mask)
-                noise_pred = uncond_noise_pred + args.guidance_scale * (noise_pred - uncond_noise_pred)
+    if args.sampler == "er_sde":
+        def predict_denoised_x0(current_latents, sigma_scalar):
+            velocity = run_velocity_with_cfg(current_latents, sigma_scalar).to(torch.float32)
+            return current_latents.to(torch.float32) - sigma_scalar.to(torch.float32) * velocity
 
-            # ensure latents dtype is consistent
-            latents = hunyuan_image_utils.step(latents, noise_pred, sigmas, i).to(latents.dtype)
-
-            pbar.update()
+        latents = anima_er_sde_sampling.sample_er_sde_rectified_flow(
+            predict_denoised_x0, latents, sigmas, seed=args.seed
+        ).to(latents.dtype)
+    else:
+        with tqdm(total=len(sigmas) - 1, desc="Denoising steps") as pbar:
+            for i in range(len(sigmas) - 1):
+                noise_pred = run_velocity_with_cfg(latents, sigmas[i])
+                latents = hunyuan_image_utils.step(latents, noise_pred, sigmas, i).to(latents.dtype)
+                pbar.update()
 
     return latents
 
@@ -636,24 +670,36 @@ def save_latent(latent: torch.Tensor, args: argparse.Namespace, height: int, wid
     return latent_path
 
 
-def save_images(sample: torch.Tensor, args: argparse.Namespace, original_base_name: Optional[str] = None) -> str:
+def save_images(
+    sample: torch.Tensor,
+    args: argparse.Namespace,
+    original_base_name: Optional[str] = None,
+    precomputed_image_name: Optional[str] = None,
+) -> str:
     """Save images to directory
 
     Args:
         sample: Video tensor
         args: command line arguments
         original_base_name: Original base name (if latents are loaded from files)
+        precomputed_image_name: If provided, use this exact base name for the PNG (its settings
+            sidecar was already written before generation, so it is not re-written here).
 
     Returns:
         str: Path to saved images directory
     """
     save_path = args.save_path
     os.makedirs(save_path, exist_ok=True)
-    time_flag = get_time_flag()
 
-    seed = args.seed
-    original_name = "" if original_base_name is None else f"_{original_base_name}"
-    image_name = f"{time_flag}_{seed}{original_name}"
+    if precomputed_image_name is not None:
+        image_name = precomputed_image_name
+    else:
+        time_flag = get_time_flag()
+        seed = args.seed
+        original_name = "" if original_base_name is None else f"_{original_base_name}"
+        image_name = f"{time_flag}_{seed}{original_name}"
+        # Non-batch modes write the sidecar here (batch mode writes it before generation).
+        write_generation_settings_sidecar(save_path, image_name, args)
 
     x = torch.clamp(sample, -1.0, 1.0)
     x = ((x + 1.0) * 127.5).to(torch.uint8).cpu().numpy()
@@ -673,6 +719,7 @@ def save_output(
     latent: torch.Tensor,
     device: torch.device,
     original_base_name: Optional[str] = None,
+    precomputed_image_name: Optional[str] = None,
 ) -> None:
     """save output
 
@@ -716,7 +763,7 @@ def save_output(
             original_name = ""
         else:
             original_name = f"_{original_base_name}"
-        save_images(image, args, original_name)
+        save_images(image, args, original_name, precomputed_image_name=precomputed_image_name)
 
 
 def preprocess_prompts_for_batch(prompt_lines: List[str], base_args: argparse.Namespace) -> List[Dict]:
@@ -829,66 +876,58 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
     gc.collect()  # Force cleanup of Text Encoder from GPU memory
     clean_memory_on_device(device)
 
-    all_latents = []
+    # Keep the DiT and VAE both resident so each prompt is generated, decoded, and saved before
+    # moving to the next prompt, rather than saving everything at the end. The settings .txt is
+    # written BEFORE generation (using a base name reused by the PNG) so you can read what is being
+    # generated while it renders. This is the inference path (no gradients), so both models fit; if it
+    # ever OOMs, decode can be moved back to a separate post-generation phase.
+    if args.output_type != "latent":
+        vae_for_batch.to(device)
 
-    logger.info("Generating latents for all prompts...")
+    os.makedirs(args.save_path, exist_ok=True)
+
+    logger.info("Generating and saving each prompt's output before moving to the next...")
     with torch.no_grad():
         for i, prompt_args_item in enumerate(all_prompt_args_list):
             current_text_data = all_precomputed_text_data[i]
             height, width = check_inputs(prompt_args_item)  # Get height/width for each prompt
 
-            logger.info(f"Generating latent for prompt {i+1}/{len(all_prompt_args_list)}: {prompt_args_item.prompt}")
+            # Reserve the base name and write the settings sidecar before generation starts.
+            image_base_name = f"{get_time_flag()}_{prompt_args_item.seed}"
+            if prompt_args_item.output_type != "latent":
+                write_generation_settings_sidecar(args.save_path, image_base_name, prompt_args_item)
+
+            logger.info(f"Generating {i+1}/{len(all_prompt_args_list)}: {prompt_args_item.prompt}")
             try:
-                # generate is called with precomputed data, so it won't load Text Encoders.
-                # It will use the DiT model from shared_models_for_generate.
+                # generate uses precomputed text data and the resident DiT (shared_models_for_generate).
                 latent = generate(prompt_args_item, gen_settings, shared_models_for_generate, current_text_data)
 
-                if latent is None:  # and prompt_args_item.save_merged_model:  # Should be caught earlier
+                if latent is None:
                     continue
 
-                # Save latent if needed (using data from precomputed_image_data for H/W)
                 if prompt_args_item.output_type in ["latent", "latent_images"]:
                     save_latent(latent, prompt_args_item, height, width)
 
-                all_latents.append(latent)
+                if prompt_args_item.output_type != "latent":
+                    # latent_images already saved the latent above; decode + save the image now.
+                    if prompt_args_item.output_type == "latent_images":
+                        prompt_args_item.output_type = "images"
+                    save_output(prompt_args_item, vae_for_batch, latent, device, precomputed_image_name=image_base_name)
+
+                del latent
             except Exception as e:
-                logger.error(f"Error generating latent for prompt: {prompt_args_item.prompt}. Error: {e}", exc_info=True)
-                all_latents.append(None)  # Add placeholder for failed generations
+                logger.error(f"Error generating/saving prompt: {prompt_args_item.prompt}. Error: {e}", exc_info=True)
                 continue
 
-    # Free DiT model
-    logger.info("Releasing DiT model from memory...")
-
+    # Free DiT and VAE
+    logger.info("Releasing DiT and VAE from memory...")
     del shared_models_for_generate["model"]
     del anima
-    clean_memory_on_device(device)
-    synchronize_device(device)  # Ensure memory is freed before loading VAE for decoding
-
-    # 4. Decode latents and save outputs (using vae_for_batch)
     if args.output_type != "latent":
-        logger.info("Decoding latents to videos/images using batched VAE...")
-        vae_for_batch.to(device)  # Move VAE to device for decoding
-
-        for i, latent in enumerate(all_latents):
-            if latent is None:  # Skip failed generations
-                logger.warning(f"Skipping decoding for prompt {i+1} due to previous error.")
-                continue
-
-            current_args = all_prompt_args_list[i]
-            logger.info(f"Decoding output {i+1}/{len(all_latents)} for prompt: {current_args.prompt}")
-
-            # if args.output_type is "latent_images", we already saved latent above.
-            # so we skip saving latent here.
-            if current_args.output_type == "latent_images":
-                current_args.output_type = "images"
-
-            # save_output expects latent to be [BCTHW] or [CTHW]. generate returns [BCTHW] (batch size 1).
-            save_output(current_args, vae_for_batch, latent, device)  # Pass vae_for_batch
-
-        vae_for_batch.to("cpu")  # Move VAE back to CPU
-
+        vae_for_batch.to("cpu")
     del vae_for_batch
     clean_memory_on_device(device)
+    synchronize_device(device)
 
 
 def process_interactive(args: argparse.Namespace) -> None:
@@ -973,9 +1012,74 @@ def get_generation_settings(args: argparse.Namespace) -> GenerationSettings:
     return gen_settings
 
 
+def expand_lora_list_tokens_into_lora_args(args) -> None:
+    """Populate args.lora_weight / args.lora_multiplier from the inline --lora_list token list.
+
+    Tokens are a flat sequence like '<path> <multiplier> <path> <multiplier> ...'. A token that
+    parses as a float is treated as the multiplier for the preceding path; any other token starts a
+    new LoRA with a default multiplier of 1.0 (so '<path>' alone also works).
+    """
+    tokens = getattr(args, "lora_list", None)
+    if not tokens:
+        return
+
+    lora_paths = []
+    lora_multipliers = []
+    for token in tokens:
+        try:
+            parsed_multiplier = float(token)
+            is_multiplier = True
+        except ValueError:
+            is_multiplier = False
+
+        if is_multiplier and lora_paths:
+            lora_multipliers[-1] = parsed_multiplier
+        elif is_multiplier and not lora_paths:
+            logger.warning(f"Ignoring --lora_list multiplier '{token}' with no preceding LoRA path")
+        else:
+            lora_paths.append(token)
+            lora_multipliers.append(1.0)
+
+    if lora_paths:
+        args.lora_weight = lora_paths
+        args.lora_multiplier = lora_multipliers
+        logger.info(f"Using {len(lora_paths)} LoRA(s) from --lora_list: {list(zip(lora_paths, lora_multipliers))}")
+
+
+def write_generation_settings_sidecar(save_path: str, image_name: str, args) -> None:
+    """Write '<image_name>.txt' next to the PNG recording the generation settings for reproducibility."""
+    image_height, image_width = args.image_size[0], args.image_size[1]
+    settings_lines = [
+        f"prompt: {args.prompt}",
+        f"negative_prompt: {args.negative_prompt}",
+        f"width: {image_width}",
+        f"height: {image_height}",
+        f"steps: {args.infer_steps}",
+        f"guidance_scale: {args.guidance_scale}",
+        f"flow_shift: {args.flow_shift}",
+        f"seed: {args.seed}",
+        f"sampler: {args.sampler}",
+        f"scheduler: {args.scheduler}",
+        f"dit: {args.dit}",
+        f"vae: {args.vae}",
+        f"text_encoder: {args.text_encoder}",
+    ]
+    if getattr(args, "lora_weight", None):
+        multipliers = args.lora_multiplier if isinstance(args.lora_multiplier, list) else [args.lora_multiplier]
+        for lora_index, lora_path in enumerate(args.lora_weight):
+            multiplier = multipliers[lora_index] if lora_index < len(multipliers) else 1.0
+            settings_lines.append(f"lora: {lora_path} {multiplier}")
+
+    settings_path = os.path.join(save_path, f"{image_name}.txt")
+    with open(settings_path, "w", encoding="utf-8") as settings_file:
+        settings_file.write("\n".join(settings_lines) + "\n")
+    logger.info(f"Settings saved to: {settings_path}")
+
+
 def main():
     # Parse arguments
     args = parse_args()
+    expand_lora_list_tokens_into_lora_args(args)
 
     # Check if latents are provided
     latents_mode = args.latent_path is not None and len(args.latent_path) > 0
