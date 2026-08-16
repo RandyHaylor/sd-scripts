@@ -150,17 +150,48 @@ def parse_args() -> argparse.Namespace:
 
     # arguments for batch and interactive modes
     parser.add_argument("--from_file", type=str, default=None, help="Read prompts from a file")
+    parser.add_argument(
+        "--from_folder",
+        type=str,
+        default=None,
+        help="Read prompts from every top-level .txt file in this folder (one prompt per file; subfolders ignored). "
+        "Each file's text is combined with --pre_prompt (prefix) and --from_folder_settings (appended flags).",
+    )
+    parser.add_argument(
+        "--from_folder_settings",
+        type=str,
+        default="",
+        help="Flag string appended to every --from_folder prompt, e.g. '--w 832 --h 1216 --s 50 --l 3.5 --fs 1.0 --d 42'",
+    )
+    parser.add_argument(
+        "--pre_prompt",
+        type=str,
+        default="",
+        help="Text prepended to every --from_folder prompt (e.g. quality/style tags). Used verbatim.",
+    )
+    parser.add_argument(
+        "--pre_prompt_neg",
+        type=str,
+        default="",
+        help="Global negative prompt applied to every --from_folder prompt (used when guidance_scale > 1).",
+    )
+    parser.add_argument(
+        "--count",
+        type=int,
+        default=None,
+        help="Limit --from_folder / --from_file to the first N prompts (files sorted by name for --from_folder); default all",
+    )
     parser.add_argument("--interactive", action="store_true", help="Interactive mode: read prompts from console")
 
     args = parser.parse_args()
 
     # Validate arguments
-    if args.from_file and args.interactive:
-        raise ValueError("Cannot use both --from_file and --interactive at the same time")
+    if sum(bool(x) for x in (args.from_file, args.from_folder, args.interactive)) > 1:
+        raise ValueError("Use only one of --from_file, --from_folder, or --interactive at the same time")
 
     if args.latent_path is None or len(args.latent_path) == 0:
-        if args.prompt is None and not args.from_file and not args.interactive:
-            raise ValueError("Either --prompt, --from_file or --interactive must be specified")
+        if args.prompt is None and not args.from_file and not args.from_folder and not args.interactive:
+            raise ValueError("Either --prompt, --from_file, --from_folder or --interactive must be specified")
 
     if args.lycoris and not lycoris_available:
         raise ValueError("install lycoris: https://github.com/KohakuBlueleaf/LyCORIS")
@@ -997,6 +1028,82 @@ def process_interactive(args: argparse.Namespace) -> None:
         print("\nExiting interactive mode")
 
 
+def process_folder_streaming(args: argparse.Namespace) -> None:
+    """Stream prompts from a folder of caption/tag .txt files, one file at a time.
+
+    For each top-level .txt file (sorted by name; --count limits the total), build the prompt
+    (--pre_prompt + caption + --from_folder_settings), write the settings sidecar, generate, then save
+    the image before moving on. Models are loaded once and reused; captions are read and encoded one
+    file at a time, so a folder with thousands of files is not processed up front.
+    """
+    gen_settings = get_generation_settings(args)
+    device = gen_settings.device
+
+    # Text encoder in shared_models; the DiT is loaded lazily by generate() and cached here for reuse.
+    shared_models = load_shared_models(args)
+    shared_models["conds_cache"] = {}
+
+    vae = anima_train_utils.load_qwen_image_vae(args, device="cpu", disable_mmap=True)
+    vae.to(torch.bfloat16)
+    vae.eval()
+    if args.output_type != "latent":
+        vae.to(device)
+
+    folder = args.from_folder
+    file_names = sorted(
+        name
+        for name in os.listdir(folder)
+        if name.lower().endswith(".txt") and os.path.isfile(os.path.join(folder, name))
+    )
+    if args.count is not None:
+        file_names = file_names[: max(0, args.count)]
+
+    pre_prompt = args.pre_prompt.strip()
+    pre_prompt_neg = args.pre_prompt_neg.strip()
+    settings = args.from_folder_settings.strip()
+    os.makedirs(args.save_path, exist_ok=True)
+
+    logger.info(f"Streaming {len(file_names)} caption file(s) from {folder}")
+    for index, file_name in enumerate(file_names):
+        try:
+            with open(os.path.join(folder, file_name), "r", encoding="utf-8") as caption_file:
+                caption = caption_file.read().strip()
+            prompt_body = f"{pre_prompt} {caption}".strip() if pre_prompt else caption
+            prompt_line = f"{prompt_body} {settings}".strip() if settings else prompt_body
+
+            prompt_args = apply_overrides(args, parse_prompt_line(prompt_line))
+            if prompt_args.seed is None:
+                prompt_args.seed = random.randint(0, 2**32 - 1)
+            if pre_prompt_neg:
+                prompt_args.negative_prompt = pre_prompt_neg
+
+            logger.info(f"[{index + 1}/{len(file_names)}] {file_name}: {prompt_args.prompt}")
+
+            # Write the settings sidecar before generation so it is readable while the image renders.
+            image_base_name = f"{get_time_flag()}_{prompt_args.seed}"
+            if prompt_args.output_type != "latent":
+                write_generation_settings_sidecar(args.save_path, image_base_name, prompt_args)
+
+            latent = generate(prompt_args, gen_settings, shared_models)
+
+            if prompt_args.output_type in ["latent", "latent_images"]:
+                height, width = check_inputs(prompt_args)
+                save_latent(latent, prompt_args, height, width)
+            if prompt_args.output_type != "latent":
+                if prompt_args.output_type == "latent_images":
+                    prompt_args.output_type = "images"
+                save_output(prompt_args, vae, latent, device, precomputed_image_name=image_base_name)
+
+            del latent
+        except Exception as exc:
+            logger.error(f"Error on caption file {file_name}: {exc}", exc_info=True)
+            continue
+
+    if args.output_type != "latent":
+        vae.to("cpu")
+    clean_memory_on_device(device)
+
+
 def get_generation_settings(args: argparse.Namespace) -> GenerationSettings:
     device = torch.device(args.device)
 
@@ -1144,7 +1251,11 @@ def main():
         encoding_strategy = strategy_anima.AnimaTextEncodingStrategy()
         strategy_base.TextEncodingStrategy.set_strategy(encoding_strategy)
 
-        if args.from_file:
+        if args.from_folder:
+            # Streaming mode: one caption file at a time (settings txt -> generate -> save -> next)
+            process_folder_streaming(args)
+
+        elif args.from_file:
             # Batch mode from file
 
             # Read prompts from file
@@ -1153,6 +1264,8 @@ def main():
 
             # Process prompts
             prompts_data = preprocess_prompts_for_batch(prompt_lines, args)
+            if args.count is not None:
+                prompts_data = prompts_data[: max(0, args.count)]
             process_batch_prompts(prompts_data, args)
 
         elif args.interactive:
