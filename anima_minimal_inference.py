@@ -2,8 +2,10 @@ import argparse
 import datetime
 import gc
 from importlib.util import find_spec
+import json
 import random
 import os
+import re
 import time
 import copy
 from types import SimpleNamespace
@@ -14,7 +16,7 @@ from safetensors.torch import load_file, save_file
 from safetensors import safe_open
 from tqdm import tqdm
 from diffusers.utils.torch_utils import randn_tensor
-from PIL import Image
+from PIL import Image, PngImagePlugin
 
 from library import (
     anima_er_sde_sampling,
@@ -39,6 +41,23 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Valid choices for the --sampler / --scheduler options. Used both to define the argparse choices and
+# to decide whether a sampler/scheduler pulled from PNG metadata maps to something this script supports.
+SAMPLER_OPTION_CHOICES = ("euler", "er_sde")
+SCHEDULER_OPTION_CHOICES = ("default", "beta57")
+
+
+def map_metadata_value_to_script_option(raw_value: Optional[str], valid_options: Tuple[str, ...]) -> Optional[str]:
+    """Map a raw metadata value (e.g. an A1111 'Sampler'/'Schedule type') to one of valid_options.
+
+    Normalizes case and spaces/hyphens to underscores, then returns the match if it is one of
+    valid_options, otherwise None (so the caller falls back to the provided/default value).
+    """
+    if not raw_value:
+        return None
+    normalized = raw_value.strip().lower().replace(" ", "_").replace("-", "_")
+    return normalized if normalized in valid_options else None
+
 
 class GenerationSettings:
     def __init__(self, device: torch.device, dit_weight_dtype: Optional[torch.dtype] = None):
@@ -50,7 +69,14 @@ def parse_args() -> argparse.Namespace:
     """parse command line arguments"""
     parser = argparse.ArgumentParser(description="HunyuanImage inference script")
 
-    parser.add_argument("--dit", type=str, default=None, help="DiT directory or path")
+    parser.add_argument(
+        "--dit",
+        type=str,
+        default=None,
+        help="DiT path. Also accepts an all-in-one checkpoint (civitai/ComfyUI CheckpointSave) with the "
+        "DiT, VAE, and text encoder baked in; the components are auto-detected and extracted once to a "
+        "sibling folder named for the model (reused on later runs), and used instead of --vae/--text_encoder.",
+    )
     parser.add_argument("--vae", type=str, default=None, help="VAE directory or path")
     parser.add_argument(
         "--vae_chunk_size",
@@ -71,7 +97,13 @@ def parse_args() -> argparse.Namespace:
         help="Use the image-only 2D Qwen-Image VAE implementation. Official Qwen-Image VAE weights are converted on load."
         + " / 画像専用の2D Qwen-Image VAE実装を使用します。公式Qwen-Image VAEの重みはロード時に変換されます。",
     )
-    parser.add_argument("--text_encoder", type=str, required=True, help="Text Encoder 1 (Qwen2.5-VL) directory or path")
+    parser.add_argument(
+        "--text_encoder",
+        type=str,
+        default=None,
+        help="Text Encoder (Qwen3) path. Optional when --dit is an all-in-one checkpoint with the text "
+        "encoder baked in (it is extracted and used automatically).",
+    )
 
     # LoRA
     parser.add_argument("--lora_weight", type=str, nargs="*", required=False, default=None, help="LoRA weight path")
@@ -87,6 +119,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--include_patterns", type=str, nargs="*", default=None, help="LoRA module include patterns")
     parser.add_argument("--exclude_patterns", type=str, nargs="*", default=None, help="LoRA module exclude patterns")
+    parser.add_argument(
+        "--lora_test_folder",
+        type=str,
+        nargs="+",
+        default=None,
+        metavar="FOLDER [MULTIPLIER]",
+        help="LoRA A/B tester: run the entire otherwise-configured generation once PER top-level .safetensors "
+        "in FOLDER (subfolders ignored), each time adding that one test LoRA on top of the fixed "
+        "--lora_list/--lora_weight LoRAs at MULTIPLIER (default 1.0; models reload per test LoRA). If a "
+        "'<loraname>.txt' sits next to a test LoRA, its text is injected after --pre_prompt and before the "
+        "main prompt (the LoRA's trigger words). Total images = (#test LoRAs) x (images otherwise). The "
+        "settings sidecar records the source image path and the test LoRA.",
+    )
 
     # inference
     parser.add_argument(
@@ -97,7 +142,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image_size", type=int, nargs=2, default=[1024, 1024], help="image size, height and width")
     parser.add_argument("--infer_steps", type=int, default=50, help="number of inference steps, default is 50")
     parser.add_argument("--save_path", type=str, required=True, help="path to save generated video")
-    parser.add_argument("--seed", type=int, default=None, help="Seed for evaluation.")
+    parser.add_argument(
+        "--seed", type=int, default=None, help="Seed for evaluation. Omit or pass -1 for a random seed."
+    )
+    parser.add_argument(
+        "--images_per_prompt",
+        type=int,
+        default=1,
+        help="Number of images to generate per prompt (currently applies to --from_image_embed). The seed "
+        "increments by one per image, so each prompt yields N seed-varied iterations.",
+    )
 
     # Flow Matching
     parser.add_argument(
@@ -131,16 +185,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sampler",
         type=str,
-        default="euler",
-        choices=["euler", "er_sde"],
-        help="sampler: euler (deterministic flow Euler, default) or er_sde (stochastic ER-SDE-Solver-3, Anima's recommended sampler)",
+        default="er_sde",
+        choices=list(SAMPLER_OPTION_CHOICES),
+        help="sampler: euler (deterministic flow Euler) or er_sde (stochastic ER-SDE-Solver-3, Anima's "
+        "recommended sampler and the default here)",
     )
     parser.add_argument(
         "--scheduler",
         type=str,
-        default="default",
-        choices=["default", "beta57"],
-        help="sigma scheduler: default (flow-shifted linspace) or beta57 (RES4LYF beta alpha=0.5/beta=0.7, more low-noise emphasis)",
+        default="beta57",
+        choices=list(SCHEDULER_OPTION_CHOICES),
+        help="sigma scheduler: default (flow-shifted linspace) or beta57 (RES4LYF beta alpha=0.5/beta=0.7, "
+        "more low-noise emphasis; the default here for Anima)",
     )
     parser.add_argument("--no_metadata", action="store_true", help="do not save metadata")
     parser.add_argument("--latent_path", type=str, nargs="*", default=None, help="path to latent for decode. no inference")
@@ -176,22 +232,61 @@ def parse_args() -> argparse.Namespace:
         help="Global negative prompt applied to every --from_folder prompt (used when guidance_scale > 1).",
     )
     parser.add_argument(
-        "--count",
+        "--from_image_embed",
+        type=str,
+        nargs="+",
+        default=None,
+        metavar="[prompts_only] [ignore_negative_prompt] [prompt_only_and_all_settings] FOLDER",
+        help="Read prompts from the A1111 'parameters' metadata embedded in every top-level .png in FOLDER "
+        "(one image per prompt; subfolders ignored). Positive and negative prompts are pulled from the "
+        "metadata, and Steps/CFG scale/Seed/Size/Sampler/Scheduler are applied per-image when present "
+        "(sampler/scheduler only when they map to a script choice). Prefix the folder with the literal "
+        "keyword 'prompts_only' to pull ONLY the positive/negative prompts and keep all settings from the "
+        "CLI args; 'ignore_negative_prompt' to discard the metadata negative (falls back to CLI / "
+        "--pre_prompt_neg); or 'prompt_only_and_all_settings' to render a comparison PAIR per prompt (one "
+        "prompt-only image and one all-metadata-settings image, both at the same --seed). Keywords may be "
+        "combined in any order before FOLDER.",
+    )
+    parser.add_argument(
+        "--prompt_count",
         type=int,
         default=None,
-        help="Limit --from_folder / --from_file to the first N prompts (files sorted by name for --from_folder); default all",
+        help="Limit --from_folder / --from_file / --from_image_embed to the first N usable prompts "
+        "(files sorted by name for --from_folder / --from_image_embed); default all",
+    )
+    parser.add_argument(
+        "--prompt_count_skip_first",
+        type=int,
+        default=0,
+        help="Skip the first N usable prompts before applying --prompt_count (for --from_folder / "
+        "--from_file / --from_image_embed). Usable-counted, so it paginates cleanly: e.g. run once with "
+        "--prompt_count 4, then again with --prompt_count_skip_first 4 --prompt_count 4 for the next 4.",
     )
     parser.add_argument("--interactive", action="store_true", help="Interactive mode: read prompts from console")
 
     args = parser.parse_args()
 
+    normalize_from_image_embed_arg(args)
+
     # Validate arguments
-    if sum(bool(x) for x in (args.from_file, args.from_folder, args.interactive)) > 1:
-        raise ValueError("Use only one of --from_file, --from_folder, or --interactive at the same time")
+    if sum(bool(x) for x in (args.from_file, args.from_folder, args.from_image_embed, args.interactive)) > 1:
+        raise ValueError("Use only one of --from_file, --from_folder, --from_image_embed, or --interactive at the same time")
 
     if args.latent_path is None or len(args.latent_path) == 0:
-        if args.prompt is None and not args.from_file and not args.from_folder and not args.interactive:
-            raise ValueError("Either --prompt, --from_file, --from_folder or --interactive must be specified")
+        if (
+            args.prompt is None
+            and not args.from_file
+            and not args.from_folder
+            and not args.from_image_embed
+            and not args.interactive
+        ):
+            raise ValueError("Either --prompt, --from_file, --from_folder, --from_image_embed or --interactive must be specified")
+
+    if args.lora_test_folder and args.interactive:
+        raise ValueError("--lora_test_folder cannot be combined with --interactive")
+
+    if args.lora_test_folder and args.latent_path:
+        raise ValueError("--lora_test_folder cannot be combined with --latent_path (latent decode does not use LoRAs)")
 
     if args.lycoris and not lycoris_available:
         raise ValueError("install lycoris: https://github.com/KohakuBlueleaf/LyCORIS")
@@ -200,6 +295,324 @@ def parse_args() -> argparse.Namespace:
         args.attn_mode = "torch"  # backward compatibility
 
     return args
+
+
+FROM_IMAGE_EMBED_PROMPTS_ONLY_KEYWORD = "prompts_only"
+FROM_IMAGE_EMBED_IGNORE_NEGATIVE_KEYWORD = "ignore_negative_prompt"
+FROM_IMAGE_EMBED_PROMPT_ONLY_AND_ALL_SETTINGS_KEYWORD = "prompt_only_and_all_settings"
+FROM_IMAGE_EMBED_KEYWORDS = (
+    FROM_IMAGE_EMBED_PROMPTS_ONLY_KEYWORD,
+    FROM_IMAGE_EMBED_IGNORE_NEGATIVE_KEYWORD,
+    FROM_IMAGE_EMBED_PROMPT_ONLY_AND_ALL_SETTINGS_KEYWORD,
+)
+
+
+def normalize_from_image_embed_arg(args: argparse.Namespace) -> None:
+    """Split the raw --from_image_embed tokens into a folder path plus mode flags.
+
+    The user may pass '<folder>', optionally preceded (in any order) by the literal keywords
+    'prompts_only', 'ignore_negative_prompt', and/or 'prompt_only_and_all_settings'. After this runs,
+    args.from_image_embed is the folder path string (or None), and args.from_image_embed_prompts_only /
+    args.from_image_embed_ignore_negative_prompt / args.from_image_embed_prompt_only_and_all_settings
+    are bools.
+    """
+    tokens = getattr(args, "from_image_embed", None)
+    args.from_image_embed_prompts_only = False
+    args.from_image_embed_ignore_negative_prompt = False
+    args.from_image_embed_prompt_only_and_all_settings = False
+
+    if not tokens:
+        args.from_image_embed = None
+        return
+
+    remaining_tokens = list(tokens)
+    while remaining_tokens and remaining_tokens[0] in FROM_IMAGE_EMBED_KEYWORDS:
+        keyword = remaining_tokens.pop(0)
+        if keyword == FROM_IMAGE_EMBED_PROMPTS_ONLY_KEYWORD:
+            args.from_image_embed_prompts_only = True
+        elif keyword == FROM_IMAGE_EMBED_IGNORE_NEGATIVE_KEYWORD:
+            args.from_image_embed_ignore_negative_prompt = True
+        else:
+            args.from_image_embed_prompt_only_and_all_settings = True
+
+    if len(remaining_tokens) != 1:
+        raise ValueError(
+            "--from_image_embed expects a single folder path, optionally preceded by the keyword(s) "
+            f"{FROM_IMAGE_EMBED_KEYWORDS} (got: {getattr(args, 'from_image_embed')})"
+        )
+
+    args.from_image_embed = remaining_tokens[0]
+
+
+def parse_a1111_png_prompt_metadata(parameters_text: str) -> Dict[str, Any]:
+    """Parse an Automatic1111-style 'parameters' metadata string into prompt + settings overrides.
+
+    The A1111 format is:
+        <positive prompt, may span multiple lines>
+        Negative prompt: <negative prompt, may span multiple lines>
+        Steps: 20, Sampler: Euler a, CFG scale: 5.0, Seed: 12345, Size: 1024x1536, ...
+
+    Returns a dict using the same override keys as parse_prompt_line (prompt, negative_prompt,
+    infer_steps, guidance_scale, seed, image_size_width, image_size_height). Keys are only present
+    when found in the metadata.
+    """
+    overrides: Dict[str, Any] = {}
+    if not parameters_text or not parameters_text.strip():
+        return overrides
+
+    lines = parameters_text.split("\n")
+
+    # The trailing settings line (if any) always starts with "Steps:" in A1111 output.
+    settings_line = ""
+    if lines and lines[-1].strip().startswith("Steps:"):
+        settings_line = lines[-1].strip()
+        body = "\n".join(lines[:-1])
+    else:
+        body = parameters_text
+
+    negative_marker = "Negative prompt:"
+    if negative_marker in body:
+        marker_index = body.index(negative_marker)
+        overrides["prompt"] = body[:marker_index].strip()
+        overrides["negative_prompt"] = body[marker_index + len(negative_marker):].strip()
+    else:
+        overrides["prompt"] = body.strip()
+
+    if settings_line:
+        steps_match = re.search(r"Steps:\s*(\d+)", settings_line)
+        if steps_match:
+            overrides["infer_steps"] = int(steps_match.group(1))
+
+        cfg_match = re.search(r"CFG scale:\s*([\d.]+)", settings_line)
+        if cfg_match:
+            overrides["guidance_scale"] = float(cfg_match.group(1))
+
+        seed_match = re.search(r"Seed:\s*(\d+)", settings_line)
+        if seed_match:
+            overrides["seed"] = int(seed_match.group(1))
+
+        # A1111 records Size as WIDTHxHEIGHT; this script's image_size is [height, width].
+        size_match = re.search(r"Size:\s*(\d+)x(\d+)", settings_line)
+        if size_match:
+            overrides["image_size_width"] = int(size_match.group(1))
+            overrides["image_size_height"] = int(size_match.group(2))
+
+        # Sampler / scheduler are only carried over when the metadata value maps to a script option;
+        # otherwise the key is omitted so the provided/default --sampler/--scheduler is used.
+        sampler_match = re.search(r"Sampler:\s*([^,]+)", settings_line)
+        if sampler_match:
+            sampler_option = map_metadata_value_to_script_option(sampler_match.group(1), SAMPLER_OPTION_CHOICES)
+            if sampler_option:
+                overrides["sampler"] = sampler_option
+
+        scheduler_match = re.search(r"(?:Schedule type|Scheduler):\s*([^,]+)", settings_line)
+        if scheduler_match:
+            scheduler_option = map_metadata_value_to_script_option(scheduler_match.group(1), SCHEDULER_OPTION_CHOICES)
+            if scheduler_option:
+                overrides["scheduler"] = scheduler_option
+
+    return overrides
+
+
+IMAGE_EMBED_PROMPT_KEYS = ("prompt", "negative_prompt")
+
+
+def apply_image_embed_settings_gate(
+    overrides: Dict[str, Any], prompts_only: bool, ignore_negative_prompt: bool = False
+) -> Dict[str, Any]:
+    """Decide which parsed metadata overrides to keep for a PNG.
+
+    - prompts_only: keep only the positive/negative prompts; steps/guidance/seed/size come from CLI.
+    - Otherwise settings mode requires BOTH Steps and CFG scale in the metadata. If either is missing,
+      all settings are dropped and only the prompts are kept (revert to prompt-only). When settings
+      mode applies, a missing Seed defaults to 0, while a missing Size is simply not overridden (the
+      CLI-provided image size is used).
+    - ignore_negative_prompt: drop the metadata negative prompt regardless of the above, so the
+      negative falls back to the CLI value (blank or --pre_prompt_neg).
+    """
+    if prompts_only:
+        gated_overrides = {key: value for key, value in overrides.items() if key in IMAGE_EMBED_PROMPT_KEYS}
+    elif "infer_steps" in overrides and "guidance_scale" in overrides:
+        gated_overrides = dict(overrides)
+        if "seed" not in gated_overrides:
+            gated_overrides["seed"] = 0
+    else:
+        gated_overrides = {key: value for key, value in overrides.items() if key in IMAGE_EMBED_PROMPT_KEYS}
+
+    if ignore_negative_prompt:
+        gated_overrides.pop("negative_prompt", None)
+
+    return gated_overrides
+
+
+def parse_comfyui_prompt_metadata(prompt_json_text: str) -> Dict[str, Any]:
+    """Parse a ComfyUI 'prompt' node-graph JSON into prompt + settings overrides.
+
+    Finds the sampler node (the one whose inputs carry both 'positive' and 'negative' links), follows
+    those links to the CLIPTextEncode 'text', and reads seed/steps/cfg/sampler/scheduler from the
+    sampler node and width/height from the linked latent image. Sampler/scheduler are only kept when
+    they map to a script choice. Returns {} when no usable positive prompt is found.
+    """
+    try:
+        graph = json.loads(prompt_json_text)
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(graph, dict):
+        return {}
+
+    sampler_inputs = None
+    for node in graph.values():
+        if not isinstance(node, dict):
+            continue
+        node_inputs = node.get("inputs")
+        if isinstance(node_inputs, dict) and "positive" in node_inputs and "negative" in node_inputs:
+            sampler_inputs = node_inputs
+            break
+    if sampler_inputs is None:
+        return {}
+
+    def linked_text(link_ref: Any) -> Optional[str]:
+        if isinstance(link_ref, list) and link_ref:
+            target_node = graph.get(str(link_ref[0]))
+            if isinstance(target_node, dict):
+                text_value = target_node.get("inputs", {}).get("text")
+                if isinstance(text_value, str):
+                    return text_value.strip()
+        return None
+
+    positive_prompt = linked_text(sampler_inputs.get("positive"))
+    if not positive_prompt:
+        return {}
+
+    overrides: Dict[str, Any] = {"prompt": positive_prompt}
+
+    negative_prompt = linked_text(sampler_inputs.get("negative"))
+    if negative_prompt is not None:
+        overrides["negative_prompt"] = negative_prompt
+
+    steps_value = sampler_inputs.get("steps")
+    if isinstance(steps_value, int):
+        overrides["infer_steps"] = steps_value
+
+    cfg_value = sampler_inputs.get("cfg")
+    if isinstance(cfg_value, (int, float)):
+        overrides["guidance_scale"] = float(cfg_value)
+
+    seed_value = sampler_inputs.get("seed")
+    if isinstance(seed_value, int):
+        overrides["seed"] = seed_value
+
+    sampler_option = map_metadata_value_to_script_option(sampler_inputs.get("sampler_name"), SAMPLER_OPTION_CHOICES)
+    if sampler_option:
+        overrides["sampler"] = sampler_option
+
+    scheduler_option = map_metadata_value_to_script_option(sampler_inputs.get("scheduler"), SCHEDULER_OPTION_CHOICES)
+    if scheduler_option:
+        overrides["scheduler"] = scheduler_option
+
+    latent_ref = sampler_inputs.get("latent_image")
+    if isinstance(latent_ref, list) and latent_ref:
+        latent_node = graph.get(str(latent_ref[0]))
+        if isinstance(latent_node, dict):
+            latent_inputs = latent_node.get("inputs", {})
+            latent_width = latent_inputs.get("width")
+            latent_height = latent_inputs.get("height")
+            if isinstance(latent_width, int) and isinstance(latent_height, int):
+                overrides["image_size_width"] = latent_width
+                overrides["image_size_height"] = latent_height
+
+    return overrides
+
+
+def decode_exif_user_comment_bytes(raw_user_comment: Any) -> str:
+    """Decode an EXIF UserComment value (per-spec 8-byte charset prefix) into text.
+
+    Handles UNICODE (UTF-16, byte order guessed by which decoding yields more printable ASCII), ASCII,
+    already-decoded str, and unknown/other as UTF-8. Returns '' when nothing decodable.
+    """
+    if isinstance(raw_user_comment, str):
+        return raw_user_comment.strip()
+    if not isinstance(raw_user_comment, (bytes, bytearray)):
+        return ""
+
+    charset_prefix = bytes(raw_user_comment[:8])
+    comment_body = bytes(raw_user_comment[8:])
+
+    if charset_prefix.startswith(b"UNICODE"):
+        def printable_score(text: str) -> int:
+            return sum(1 for character in text if 32 <= ord(character) < 127)
+
+        candidates = [comment_body.decode(encoding, errors="replace") for encoding in ("utf-16-le", "utf-16-be")]
+        return max(candidates, key=printable_score).strip()
+    if charset_prefix.startswith(b"ASCII"):
+        return comment_body.decode("ascii", errors="replace").strip()
+    return bytes(raw_user_comment).decode("utf-8", errors="replace").strip()
+
+
+def extract_exif_user_comment_text(exif) -> str:
+    """Return the decoded EXIF UserComment text from a PIL Exif object, or '' if absent.
+
+    UserComment (tag 0x9286) lives in the Exif sub-IFD (0x8769), so it is looked up there as well.
+    """
+    if not exif:
+        return ""
+    user_comment = exif.get(0x9286)
+    if user_comment is None:
+        try:
+            exif_sub_ifd = exif.get_ifd(0x8769)
+        except Exception:
+            exif_sub_ifd = None
+        if exif_sub_ifd:
+            user_comment = exif_sub_ifd.get(0x9286)
+    if not user_comment:
+        return ""
+    return decode_exif_user_comment_bytes(user_comment)
+
+
+def read_png_parsed_metadata(png_path: str) -> Optional[Dict[str, Any]]:
+    """Read a PNG's embedded generation metadata and return the raw (ungated) parsed overrides.
+
+    Tries, in order: Automatic1111 'parameters' text, ComfyUI 'prompt' node graph, then the EXIF
+    UserComment (which may itself be an A1111 parameters string). Returns the first parse that yields a
+    positive prompt, or None if none do. Callers apply gating per render variant.
+    """
+    with Image.open(png_path) as image:
+        image_info = dict(image.info)
+        user_comment_text = extract_exif_user_comment_text(image.getexif())
+
+    parameters_text = image_info.get("parameters")
+    if parameters_text:
+        a1111_overrides = parse_a1111_png_prompt_metadata(parameters_text)
+        if a1111_overrides.get("prompt"):
+            return a1111_overrides
+
+    comfyui_prompt_text = image_info.get("prompt")
+    if comfyui_prompt_text:
+        comfyui_overrides = parse_comfyui_prompt_metadata(comfyui_prompt_text)
+        if comfyui_overrides.get("prompt"):
+            return comfyui_overrides
+
+    if user_comment_text:
+        exif_overrides = parse_a1111_png_prompt_metadata(user_comment_text)
+        if exif_overrides.get("prompt"):
+            return exif_overrides
+
+    return None
+
+
+def read_png_prompt_overrides(
+    png_path: str, prompts_only: bool, ignore_negative_prompt: bool = False
+) -> Optional[Dict[str, Any]]:
+    """Read a PNG's A1111 'parameters' metadata and return gated prompt/settings overrides.
+
+    Returns None when the PNG has no 'parameters' metadata or no positive prompt in it (the caller
+    logs an error and skips). See apply_image_embed_settings_gate for how settings are gated.
+    """
+    parsed = read_png_parsed_metadata(png_path)
+    if parsed is None:
+        return None
+
+    return apply_image_embed_settings_gate(parsed, prompts_only, ignore_negative_prompt)
 
 
 def parse_prompt_line(line: str) -> Dict[str, Any]:
@@ -544,7 +957,7 @@ def generate(
     device, dit_weight_dtype = (gen_settings.device, gen_settings.dit_weight_dtype)
 
     # prepare seed
-    seed = args.seed if args.seed is not None else random.randint(0, 2**32 - 1)
+    seed = resolve_random_seed(args.seed)
     args.seed = seed  # set seed to args for saving
 
     if shared_models is None or "model" not in shared_models:
@@ -655,6 +1068,45 @@ def generate_body(
     return latents
 
 
+def stream_usable_prompt_overrides(items, load_overrides_for_item, prompt_count, skip_first=0):
+    """Yield (index, item, overrides) in order, counting only usable items toward the window.
+
+    load_overrides_for_item(item) returns the override dict for an item, or None when the item has no
+    usable prompt (e.g. a PNG with no positive prompt, or an empty caption).
+
+    skip_first: skip (do not yield) the first skip_first USABLE items; unusable items encountered while
+    still skipping are passed over silently. This is usable-counted, so it paginates cleanly regardless
+    of interspersed skips (e.g. run 1 with prompt_count=4, run 2 with skip_first=4 prompt_count=4).
+
+    After the skip window, unusable items are yielded (with overrides=None) so the caller can log and
+    skip them, but they do NOT count toward prompt_count. Iteration stops once prompt_count usable
+    items have been yielded; prompt_count=None means no limit.
+    """
+    usable_skipped = 0
+    usable_yielded = 0
+    for index, item in enumerate(items):
+        if prompt_count is not None and usable_yielded >= prompt_count:
+            return
+        overrides = load_overrides_for_item(item)
+        if usable_skipped < skip_first:
+            if overrides is not None:
+                usable_skipped += 1
+            continue
+        yield index, item, overrides
+        if overrides is not None:
+            usable_yielded += 1
+
+
+def resolve_random_seed(seed_value: Optional[int]) -> int:
+    """Return seed_value, or a fresh random seed when randomization is requested.
+
+    Randomization is requested when seed_value is None (no --seed given) or -1 (explicit random).
+    """
+    if seed_value is None or seed_value == -1:
+        return random.randint(0, 2**32 - 1)
+    return seed_value
+
+
 def get_time_flag():
     return datetime.datetime.fromtimestamp(time.time()).strftime("%Y%m%d-%H%M%S-%f")[:-3]
 
@@ -737,7 +1189,12 @@ def save_images(
     x = x.transpose(1, 2, 0)  # C, H, W -> H, W, C
 
     image = Image.fromarray(x)
-    image.save(os.path.join(save_path, f"{image_name}.png"))
+
+    png_info = None
+    if not args.no_metadata:
+        png_info = PngImagePlugin.PngInfo()
+        png_info.add_text("parameters", build_png_generation_metadata_text(args))
+    image.save(os.path.join(save_path, f"{image_name}.png"), pnginfo=png_info)
 
     logger.info(f"Sample images saved to: {save_path}/{image_name}")
 
@@ -1031,7 +1488,7 @@ def process_interactive(args: argparse.Namespace) -> None:
 def process_folder_streaming(args: argparse.Namespace) -> None:
     """Stream prompts from a folder of caption/tag .txt files, one file at a time.
 
-    For each top-level .txt file (sorted by name; --count limits the total), build the prompt
+    For each top-level .txt file (sorted by name; --prompt_count limits the total), build the prompt
     (--pre_prompt + caption + --from_folder_settings), write the settings sidecar, generate, then save
     the image before moving on. Models are loaded once and reused; captions are read and encoded one
     file at a time, so a folder with thousands of files is not processed up front.
@@ -1055,27 +1512,44 @@ def process_folder_streaming(args: argparse.Namespace) -> None:
         for name in os.listdir(folder)
         if name.lower().endswith(".txt") and os.path.isfile(os.path.join(folder, name))
     )
-    if args.count is not None:
-        file_names = file_names[: max(0, args.count)]
 
     pre_prompt = args.pre_prompt.strip()
     pre_prompt_neg = args.pre_prompt_neg.strip()
     settings = args.from_folder_settings.strip()
     os.makedirs(args.save_path, exist_ok=True)
 
-    logger.info(f"Streaming {len(file_names)} caption file(s) from {folder}")
-    for index, file_name in enumerate(file_names):
+    def load_caption_overrides(file_name):
+        # Return None (unusable skip, not counted toward --prompt_count) on read error or empty caption.
         try:
             with open(os.path.join(folder, file_name), "r", encoding="utf-8") as caption_file:
                 caption = caption_file.read().strip()
-            prompt_body = f"{pre_prompt} {caption}".strip() if pre_prompt else caption
-            prompt_line = f"{prompt_body} {settings}".strip() if settings else prompt_body
+        except Exception as exc:
+            logger.error(f"Error reading caption file {file_name}: {exc}", exc_info=True)
+            return None
+        prompt_body = f"{pre_prompt} {caption}".strip() if pre_prompt else caption
+        if not prompt_body:
+            return None
+        prompt_line = f"{prompt_body} {settings}".strip() if settings else prompt_body
+        return parse_prompt_line(prompt_line)
 
-            prompt_args = apply_overrides(args, parse_prompt_line(prompt_line))
+    logger.info(
+        f"Streaming up to {args.prompt_count if args.prompt_count is not None else 'all'} usable prompt(s) "
+        f"from {len(file_names)} caption file(s) in {folder}"
+    )
+    for index, file_name, overrides in stream_usable_prompt_overrides(
+        file_names, load_caption_overrides, args.prompt_count, skip_first=args.prompt_count_skip_first
+    ):
+        try:
+            if overrides is None:
+                logger.warning(f"[{index + 1}/{len(file_names)}] {file_name}: empty caption, skipping")
+                continue
+
+            prompt_args = apply_overrides(args, overrides)
             if prompt_args.seed is None:
                 prompt_args.seed = random.randint(0, 2**32 - 1)
             if pre_prompt_neg:
                 prompt_args.negative_prompt = pre_prompt_neg
+            prompt_args.current_source_image_path = os.path.join(folder, file_name)
 
             logger.info(f"[{index + 1}/{len(file_names)}] {file_name}: {prompt_args.prompt}")
 
@@ -1097,6 +1571,138 @@ def process_folder_streaming(args: argparse.Namespace) -> None:
             del latent
         except Exception as exc:
             logger.error(f"Error on caption file {file_name}: {exc}", exc_info=True)
+            continue
+
+    if args.output_type != "latent":
+        vae.to("cpu")
+    clean_memory_on_device(device)
+
+
+def process_image_embed_streaming(args: argparse.Namespace) -> None:
+    """Stream prompts from a folder of PNGs, reading each image's A1111 'parameters' metadata.
+
+    For each top-level .png (sorted by name; --prompt_count limits usable prompts), pull the
+    positive/negative prompt (and Steps/CFG/Seed/Size/Sampler/Scheduler, subject to mode) from the
+    embedded metadata, write the settings sidecar, generate, then save the image before moving on.
+    Modes (from the --from_image_embed keywords):
+      - default: full settings mode (metadata settings applied, gated by apply_image_embed_settings_gate).
+      - prompts_only: only prompts from metadata; all settings from CLI.
+      - prompt_only_and_all_settings: render a comparison PAIR per prompt (one prompt-only image and
+        one all-metadata-settings image) at the same provided --seed so only the settings differ.
+    Models are loaded once and reused; metadata is read one file at a time. PNGs without a usable
+    positive prompt are skipped (they do not count toward --prompt_count).
+    """
+    gen_settings = get_generation_settings(args)
+    device = gen_settings.device
+
+    # Text encoder in shared_models; the DiT is loaded lazily by generate() and cached here for reuse.
+    shared_models = load_shared_models(args)
+    shared_models["conds_cache"] = {}
+
+    vae = anima_train_utils.load_qwen_image_vae(args, device="cpu", disable_mmap=True)
+    vae.to(torch.bfloat16)
+    vae.eval()
+    if args.output_type != "latent":
+        vae.to(device)
+
+    folder = args.from_image_embed
+    file_names = sorted(
+        name
+        for name in os.listdir(folder)
+        if name.lower().endswith(".png") and os.path.isfile(os.path.join(folder, name))
+    )
+
+    pre_prompt = args.pre_prompt.strip()
+    pre_prompt_neg = args.pre_prompt_neg.strip()
+    images_per_prompt = max(1, args.images_per_prompt)
+    prompts_only = args.from_image_embed_prompts_only
+    ignore_negative_prompt = args.from_image_embed_ignore_negative_prompt
+    comparison_mode = args.from_image_embed_prompt_only_and_all_settings
+    os.makedirs(args.save_path, exist_ok=True)
+
+    def load_png_parsed(file_name):
+        # Return None (unusable skip, not counted toward --prompt_count) on read/parse error or when
+        # the PNG has no positive prompt, so one bad PNG does not abort the streaming run.
+        try:
+            return read_png_parsed_metadata(os.path.join(folder, file_name))
+        except Exception as exc:
+            logger.error(f"Error reading PNG metadata from {file_name}: {exc}", exc_info=True)
+            return None
+
+    def render_one_image(gated_overrides, seed_value, variant_label, source_image_path):
+        """Apply overrides, force seed_value, and generate + save one image. variant_label (or None)
+        is appended to the file base name so a comparison pair is distinguishable on disk.
+        source_image_path is recorded in the settings sidecar."""
+        local_overrides = gated_overrides
+        if pre_prompt:
+            local_overrides = dict(local_overrides)
+            local_overrides["prompt"] = f"{pre_prompt} {local_overrides['prompt']}".strip()
+
+        prompt_args = apply_overrides(args, local_overrides)
+        if pre_prompt_neg:
+            prompt_args.negative_prompt = f"{pre_prompt_neg} {prompt_args.negative_prompt}".strip()
+        prompt_args.seed = seed_value
+        prompt_args.current_source_image_path = source_image_path
+
+        variant_suffix = f"_{variant_label}" if variant_label else ""
+        # Write the settings sidecar before generation so it is readable while the image renders.
+        image_base_name = f"{get_time_flag()}_{seed_value}{variant_suffix}"
+        if prompt_args.output_type != "latent":
+            write_generation_settings_sidecar(args.save_path, image_base_name, prompt_args)
+
+        latent = generate(prompt_args, gen_settings, shared_models)
+
+        if prompt_args.output_type in ["latent", "latent_images"]:
+            height, width = check_inputs(prompt_args)
+            save_latent(latent, prompt_args, height, width)
+        if prompt_args.output_type != "latent":
+            if prompt_args.output_type == "latent_images":
+                prompt_args.output_type = "images"
+            save_output(prompt_args, vae, latent, device, precomputed_image_name=image_base_name)
+
+        del latent
+
+    logger.info(
+        f"Streaming up to {args.prompt_count if args.prompt_count is not None else 'all'} usable prompt(s) "
+        f"from {len(file_names)} PNG(s) in {folder} "
+        f"(prompts_only={prompts_only}, ignore_negative_prompt={ignore_negative_prompt}, "
+        f"prompt_only_and_all_settings={comparison_mode}, images_per_prompt={images_per_prompt})"
+    )
+    for index, file_name, parsed_overrides in stream_usable_prompt_overrides(
+        file_names, load_png_parsed, args.prompt_count, skip_first=args.prompt_count_skip_first
+    ):
+        try:
+            if parsed_overrides is None:
+                logger.error(f"[{index + 1}/{len(file_names)}] {file_name}: no positive prompt in PNG metadata, skipping")
+                continue
+
+            source_image_path = os.path.join(folder, file_name)
+            logger.info(f"[{index + 1}/{len(file_names)}] {file_name}: {parsed_overrides['prompt']}")
+
+            if comparison_mode:
+                # One prompt-only image and one all-metadata-settings image per iteration, both at the
+                # same provided --seed (seed + iteration) so only the settings differ between them.
+                prompt_only_variant = apply_image_embed_settings_gate(
+                    parsed_overrides, prompts_only=True, ignore_negative_prompt=ignore_negative_prompt
+                )
+                all_settings_variant = apply_image_embed_settings_gate(
+                    parsed_overrides, prompts_only=False, ignore_negative_prompt=ignore_negative_prompt
+                )
+                base_seed = resolve_random_seed(args.seed)
+                for iteration in range(images_per_prompt):
+                    seed_value = base_seed + iteration
+                    render_one_image(prompt_only_variant, seed_value, "promptonly", source_image_path)
+                    render_one_image(all_settings_variant, seed_value, "allsettings", source_image_path)
+            else:
+                gated_overrides = apply_image_embed_settings_gate(
+                    parsed_overrides, prompts_only, ignore_negative_prompt
+                )
+                # Seed source: metadata Seed in settings mode (or 0), else the provided --seed.
+                base_seed = resolve_random_seed(gated_overrides.get("seed", args.seed))
+                for iteration in range(images_per_prompt):
+                    render_one_image(gated_overrides, base_seed + iteration, None, source_image_path)
+        except Exception as exc:
+            logger.error(f"Error on PNG {file_name}: {exc}", exc_info=True)
             continue
 
     if args.output_type != "latent":
@@ -1153,6 +1759,198 @@ def expand_lora_list_tokens_into_lora_args(args) -> None:
         logger.info(f"Using {len(lora_paths)} LoRA(s) from --lora_list: {list(zip(lora_paths, lora_multipliers))}")
 
 
+# An all-in-one civitai/ComfyUI "CheckpointSave" bundles the DiT, VAE, and text encoder into one
+# safetensors under these prefixes. Each entry maps that bundled component to the split-file key layout
+# the script's loaders expect (verified against the official split files: DiT keys carry a 'net.' prefix,
+# VAE/text-encoder keys are bare). The text-encoder source prefix includes '.transformer.' so the extra
+# 'cond_stage_model.qwen3_06b.logit_scale' key is naturally excluded.
+COMBINED_CHECKPOINT_COMPONENTS = [
+    {"name": "dit", "arg": "dit", "source_prefix": "model.diffusion_model.", "target_prefix": "net.", "filename": "dit.safetensors"},
+    {"name": "vae", "arg": "vae", "source_prefix": "first_stage_model.", "target_prefix": "", "filename": "vae.safetensors"},
+    {
+        "name": "text_encoder",
+        "arg": "text_encoder",
+        "source_prefix": "cond_stage_model.qwen3_06b.transformer.",
+        "target_prefix": "",
+        "filename": "text_encoder.safetensors",
+    },
+]
+
+COMBINED_CHECKPOINT_DETECT_PREFIXES = ("model.diffusion_model.", "first_stage_model.", "cond_stage_model.")
+
+
+def detect_combined_checkpoint(keys) -> bool:
+    """True when the given safetensors keys include all three combined-checkpoint component prefixes."""
+    key_list = list(keys)
+    return all(any(key.startswith(prefix) for key in key_list) for prefix in COMBINED_CHECKPOINT_DETECT_PREFIXES)
+
+
+def derive_extracted_models_folder(dit_path: str) -> str:
+    """Return the sibling folder (named for the model, next to it) where extracted components live."""
+    return os.path.splitext(dit_path)[0]
+
+
+def rename_combined_component_keys(all_keys, source_prefix: str, target_prefix: str) -> Dict[str, str]:
+    """Return {new_key: original_key} for keys under source_prefix, remapped to target_prefix."""
+    key_rename_map = {}
+    for key in all_keys:
+        if key.startswith(source_prefix):
+            key_rename_map[target_prefix + key[len(source_prefix):]] = key
+    return key_rename_map
+
+
+def extract_combined_checkpoint_to_folder(combined_checkpoint_path: str, output_folder: str) -> Dict[str, str]:
+    """Extract the bundled DiT/VAE/text-encoder from a combined checkpoint into split files in
+    output_folder (one component at a time to limit memory). Returns {component_name: file_path}."""
+    os.makedirs(output_folder, exist_ok=True)
+    extracted_paths = {}
+    with safe_open(combined_checkpoint_path, framework="pt") as checkpoint:
+        all_keys = list(checkpoint.keys())
+        for component in COMBINED_CHECKPOINT_COMPONENTS:
+            key_rename_map = rename_combined_component_keys(
+                all_keys, component["source_prefix"], component["target_prefix"]
+            )
+            component_state_dict = {
+                new_key: checkpoint.get_tensor(original_key) for new_key, original_key in key_rename_map.items()
+            }
+            output_path = os.path.join(output_folder, component["filename"])
+            logger.info(f"Extracting {component['name']} ({len(component_state_dict)} tensors) -> {output_path}")
+            save_file(component_state_dict, output_path)
+            del component_state_dict
+            extracted_paths[component["name"]] = output_path
+    return extracted_paths
+
+
+def prepare_split_models_from_combined_checkpoint(args: argparse.Namespace) -> None:
+    """If --dit is an all-in-one checkpoint (DiT+VAE+text encoder baked in), extract the three
+    components once to a sibling folder named for the model (reused on later runs) and point
+    args.dit/vae/text_encoder at them. Baked-in components take precedence over any explicitly
+    provided --vae/--text_encoder (per user preference: easier to just pass the one checkpoint)."""
+    if not args.dit or not os.path.isfile(args.dit):
+        return
+
+    with safe_open(args.dit, framework="pt") as checkpoint:
+        checkpoint_keys = list(checkpoint.keys())
+    if not detect_combined_checkpoint(checkpoint_keys):
+        return
+
+    output_folder = derive_extracted_models_folder(args.dit)
+    expected_paths = {
+        component["name"]: os.path.join(output_folder, component["filename"])
+        for component in COMBINED_CHECKPOINT_COMPONENTS
+    }
+    if all(os.path.isfile(path) for path in expected_paths.values()):
+        logger.info(f"Using previously extracted models from combined checkpoint in: {output_folder}")
+        extracted_paths = expected_paths
+    else:
+        logger.info(f"Combined checkpoint detected. Extracting embedded DiT/VAE/text encoder to: {output_folder}")
+        extracted_paths = extract_combined_checkpoint_to_folder(args.dit, output_folder)
+
+    if (args.vae and args.vae != extracted_paths["vae"]) or (
+        args.text_encoder and args.text_encoder != extracted_paths["text_encoder"]
+    ):
+        logger.info("Using the checkpoint's baked-in VAE/text encoder (overriding explicitly provided --vae/--text_encoder).")
+
+    args.dit = extracted_paths["dit"]
+    args.vae = extracted_paths["vae"]
+    args.text_encoder = extracted_paths["text_encoder"]
+
+
+def normalize_lora_test_folder_arg(args: argparse.Namespace) -> None:
+    """Split the raw --lora_test_folder tokens into a folder path and a test-LoRA multiplier.
+
+    Accepts '<folder>' or '<folder> <multiplier>'. After this runs, args.lora_test_folder is the folder
+    path string (or None) and args.lora_test_multiplier is a float (default 1.0).
+    """
+    tokens = getattr(args, "lora_test_folder", None)
+    args.lora_test_multiplier = 1.0
+
+    if not tokens:
+        args.lora_test_folder = None
+        return
+
+    if len(tokens) > 2:
+        raise ValueError(f"--lora_test_folder expects '<folder> [multiplier]' (got: {tokens})")
+
+    args.lora_test_folder = tokens[0]
+    if len(tokens) == 2:
+        try:
+            args.lora_test_multiplier = float(tokens[1])
+        except ValueError:
+            raise ValueError(f"--lora_test_folder multiplier must be a number (got: {tokens[1]!r})")
+
+
+def list_test_lora_paths(folder: str) -> List[str]:
+    """Return sorted full paths of top-level .safetensors LoRA files in folder (subfolders ignored)."""
+    return sorted(
+        os.path.join(folder, name)
+        for name in os.listdir(folder)
+        if name.lower().endswith(".safetensors") and os.path.isfile(os.path.join(folder, name))
+    )
+
+
+def read_lora_trigger_prompt_text(lora_path: str) -> str:
+    """Return the text from the '<lora_basename>.txt' sidecar next to lora_path, or '' if absent."""
+    trigger_text_path = os.path.splitext(lora_path)[0] + ".txt"
+    if not os.path.isfile(trigger_text_path):
+        return ""
+    with open(trigger_text_path, "r", encoding="utf-8") as trigger_file:
+        return trigger_file.read().strip()
+
+
+def compose_pre_prompt_with_lora_injection(user_pre_prompt: str, lora_injection: str) -> str:
+    """Combine the user's --pre_prompt with a test LoRA's trigger text (user first, then injection)."""
+    return f"{user_pre_prompt.strip()} {lora_injection.strip()}".strip()
+
+
+def build_args_for_test_lora(base_args: argparse.Namespace, test_lora_path: str) -> argparse.Namespace:
+    """Return a deep-copied args with the test LoRA appended to the fixed LoRAs and its trigger text
+    injected into the pre-prompt. base_args is not mutated."""
+    test_args = copy.deepcopy(base_args)
+    test_args.lora_test_folder = None  # prevent the sweep from recursing
+
+    fixed_lora_weights = list(base_args.lora_weight) if base_args.lora_weight else []
+    if isinstance(base_args.lora_multiplier, list):
+        fixed_lora_multipliers = list(base_args.lora_multiplier)
+    elif base_args.lora_multiplier is None:
+        fixed_lora_multipliers = []
+    else:
+        fixed_lora_multipliers = [base_args.lora_multiplier]
+    # Align multipliers to the fixed weights: pad short (default 1.0) and drop any extras (e.g. the
+    # scalar default multiplier carried when there are no fixed LoRA weights).
+    fixed_lora_multipliers = (fixed_lora_multipliers + [1.0] * len(fixed_lora_weights))[: len(fixed_lora_weights)]
+
+    test_args.lora_weight = fixed_lora_weights + [test_lora_path]
+    test_args.lora_multiplier = fixed_lora_multipliers + [base_args.lora_test_multiplier]
+
+    lora_injection = read_lora_trigger_prompt_text(test_lora_path)
+    composed_pre_prompt = compose_pre_prompt_with_lora_injection(base_args.pre_prompt, lora_injection)
+    test_args.pre_prompt = composed_pre_prompt  # used by from_folder / from_image_embed
+    test_args.lora_test_prompt_prefix = composed_pre_prompt  # used by from_file / single --prompt
+    test_args.current_test_lora = f"{test_lora_path} {base_args.lora_test_multiplier}"
+    return test_args
+
+
+def build_png_generation_metadata_text(args) -> str:
+    """Build the A1111-style 'parameters' text embedded in output PNGs: image generation data only.
+
+    Deliberately excludes file paths (model/VAE/text-encoder/LoRA paths, source image, test LoRA) so
+    the embedded metadata is portable. The format round-trips with this script's own --from_image_embed
+    reader and standard A1111 tools.
+    """
+    image_height, image_width = args.image_size[0], args.image_size[1]
+    settings_line = (
+        f"Steps: {args.infer_steps}, "
+        f"Sampler: {args.sampler}, "
+        f"CFG scale: {args.guidance_scale}, "
+        f"Seed: {args.seed}, "
+        f"Size: {image_width}x{image_height}, "  # A1111 Size is WIDTHxHEIGHT
+        f"Schedule type: {args.scheduler}, "
+        f"Flow shift: {args.flow_shift}"
+    )
+    return f"{args.prompt}\nNegative prompt: {args.negative_prompt}\n{settings_line}"
+
+
 def write_generation_settings_sidecar(save_path: str, image_name: str, args) -> None:
     """Write '<image_name>.txt' next to the PNG recording the generation settings for reproducibility."""
     image_height, image_width = args.image_size[0], args.image_size[1]
@@ -1177,16 +1975,114 @@ def write_generation_settings_sidecar(save_path: str, image_name: str, args) -> 
             multiplier = multipliers[lora_index] if lora_index < len(multipliers) else 1.0
             settings_lines.append(f"lora: {lora_path} {multiplier}")
 
+    source_image_path = getattr(args, "current_source_image_path", None)
+    if source_image_path:
+        settings_lines.append(f"source_image: {source_image_path}")
+
+    test_lora = getattr(args, "current_test_lora", None)
+    if test_lora:
+        settings_lines.append(f"test_lora: {test_lora}")
+
     settings_path = os.path.join(save_path, f"{image_name}.txt")
     with open(settings_path, "w", encoding="utf-8") as settings_file:
         settings_file.write("\n".join(settings_lines) + "\n")
     logger.info(f"Settings saved to: {settings_path}")
 
 
+def dispatch_generation(args: argparse.Namespace) -> None:
+    """Run one full generation for the configured mode (from_folder / from_image_embed / from_file /
+    interactive / single --prompt). Applies the test-LoRA prompt prefix to from_file / single --prompt
+    (the modes that have no --pre_prompt of their own) when set by the LoRA test sweep.
+    """
+    prompt_prefix = getattr(args, "lora_test_prompt_prefix", "")
+
+    if args.from_folder:
+        # Streaming mode: one caption file at a time (settings txt -> generate -> save -> next)
+        process_folder_streaming(args)
+
+    elif args.from_image_embed:
+        # Streaming mode: one PNG at a time, prompts pulled from embedded A1111 metadata
+        process_image_embed_streaming(args)
+
+    elif args.from_file:
+        # Batch mode from file
+        with open(args.from_file, "r", encoding="utf-8") as f:
+            prompt_lines = f.readlines()
+
+        # prompts_data is already the usable list (blank/comment lines removed), so skip_first +
+        # prompt_count paginate it directly by index.
+        prompts_data = preprocess_prompts_for_batch(prompt_lines, args)
+        if prompt_prefix:
+            for prompt_data in prompts_data:
+                prompt_data["prompt"] = f"{prompt_prefix} {prompt_data['prompt']}".strip()
+        skip_first = max(0, args.prompt_count_skip_first)
+        if args.prompt_count is not None:
+            prompts_data = prompts_data[skip_first : skip_first + max(0, args.prompt_count)]
+        else:
+            prompts_data = prompts_data[skip_first:]
+        process_batch_prompts(prompts_data, args)
+
+    elif args.interactive:
+        # Interactive mode
+        process_interactive(args)
+
+    else:
+        # Single prompt mode (original behavior)
+        gen_settings = get_generation_settings(args)
+
+        if prompt_prefix and args.prompt is not None:
+            args.prompt = f"{prompt_prefix} {args.prompt}".strip()
+
+        # For single mode, precomputed data is None, shared_models is None.
+        # generate will load all necessary models (Text Encoders, DiT).
+        latent = generate(args, gen_settings)
+
+        clean_memory_on_device(args.device)
+
+        # Save latent and video
+        vae = anima_train_utils.load_qwen_image_vae(args, device="cpu", disable_mmap=True)
+        vae.to(torch.bfloat16)
+        vae.eval()
+        save_output(args, vae, latent, args.device)
+
+
+def run_lora_test_sweep(args: argparse.Namespace) -> None:
+    """Run dispatch_generation once per top-level .safetensors in --lora_test_folder, each time with
+    that test LoRA added on top of the fixed LoRAs. Models are reloaded for each test LoRA because
+    LoRAs are merged into the DiT/text encoder at load time."""
+    test_lora_paths = list_test_lora_paths(args.lora_test_folder)
+    if not test_lora_paths:
+        logger.warning(f"No .safetensors test LoRAs found in {args.lora_test_folder}")
+        return
+
+    logger.info(f"LoRA test sweep: {len(test_lora_paths)} test LoRA(s) from {args.lora_test_folder}")
+    for index, test_lora_path in enumerate(test_lora_paths):
+        logger.info(
+            f"[test LoRA {index + 1}/{len(test_lora_paths)}] {test_lora_path} "
+            f"(multiplier {args.lora_test_multiplier})"
+        )
+        test_args = build_args_for_test_lora(args, test_lora_path)
+        dispatch_generation(test_args)
+
+
 def main():
     # Parse arguments
     args = parse_args()
     expand_lora_list_tokens_into_lora_args(args)
+    normalize_lora_test_folder_arg(args)
+
+    # If --dit is an all-in-one checkpoint, extract/reuse its baked-in VAE + text encoder and repoint args.
+    prepare_split_models_from_combined_checkpoint(args)
+
+    if not args.text_encoder:
+        raise ValueError(
+            "No text encoder available: pass --text_encoder, or a --dit that is an all-in-one checkpoint "
+            "with the text encoder baked in."
+        )
+    if not args.vae:
+        raise ValueError(
+            "No VAE available: pass --vae, or a --dit that is an all-in-one checkpoint with the VAE baked in."
+        )
 
     # Check if latents are provided
     latents_mode = args.latent_path is not None and len(args.latent_path) > 0
@@ -1251,44 +2147,11 @@ def main():
         encoding_strategy = strategy_anima.AnimaTextEncodingStrategy()
         strategy_base.TextEncodingStrategy.set_strategy(encoding_strategy)
 
-        if args.from_folder:
-            # Streaming mode: one caption file at a time (settings txt -> generate -> save -> next)
-            process_folder_streaming(args)
-
-        elif args.from_file:
-            # Batch mode from file
-
-            # Read prompts from file
-            with open(args.from_file, "r", encoding="utf-8") as f:
-                prompt_lines = f.readlines()
-
-            # Process prompts
-            prompts_data = preprocess_prompts_for_batch(prompt_lines, args)
-            if args.count is not None:
-                prompts_data = prompts_data[: max(0, args.count)]
-            process_batch_prompts(prompts_data, args)
-
-        elif args.interactive:
-            # Interactive mode
-            process_interactive(args)
-
+        if args.lora_test_folder:
+            # Run the whole configured generation once per test LoRA (models reload per test LoRA).
+            run_lora_test_sweep(args)
         else:
-            # Single prompt mode (original behavior)
-
-            # Generate latent
-            gen_settings = get_generation_settings(args)
-
-            # For single mode, precomputed data is None, shared_models is None.
-            # generate will load all necessary models (Text Encoders, DiT).
-            latent = generate(args, gen_settings)
-
-            clean_memory_on_device(device)
-
-            # Save latent and video
-            vae = anima_train_utils.load_qwen_image_vae(args, device="cpu", disable_mmap=True)
-            vae.to(torch.bfloat16)
-            vae.eval()
-            save_output(args, vae, latent, device)
+            dispatch_generation(args)
 
     logger.info("Done!")
 
