@@ -113,6 +113,14 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
         help="Scale factor for sigmoid (logit_normal) timestep sampling (default: 1.0)",
     )
     parser.add_argument(
+        "--anima_training_cfg",
+        type=float,
+        default=0.5,
+        help="Classifier-free guidance weight applied to the model prediction during the "
+        "training forward pass: model_pred = uncond + cfg * (cond - uncond). "
+        "1.0 = plain conditional (no guidance); default 0.5 emulates Anima's lower real-use guidance.",
+    )
+    parser.add_argument(
         "--attn_mode",
         choices=["torch", "xformers", "flash", "sageattn", "sdpa"],  # "sdpa" is for backward compatibility
         default=None,
