@@ -43,8 +43,8 @@ logger = logging.getLogger(__name__)
 
 # Valid choices for the --sampler / --scheduler options. Used both to define the argparse choices and
 # to decide whether a sampler/scheduler pulled from PNG metadata maps to something this script supports.
-SAMPLER_OPTION_CHOICES = ("euler", "er_sde")
-SCHEDULER_OPTION_CHOICES = ("default", "beta57")
+SAMPLER_OPTION_CHOICES = ("euler", "er_sde", "euler_ancestral")
+SCHEDULER_OPTION_CHOICES = ("default", "beta57", "simple")
 
 
 def map_metadata_value_to_script_option(raw_value: Optional[str], valid_options: Tuple[str, ...]) -> Optional[str]:
@@ -187,16 +187,18 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="er_sde",
         choices=list(SAMPLER_OPTION_CHOICES),
-        help="sampler: euler (deterministic flow Euler) or er_sde (stochastic ER-SDE-Solver-3, Anima's "
-        "recommended sampler and the default here)",
+        help="sampler: euler (deterministic flow Euler), er_sde (stochastic ER-SDE-Solver-3, Anima's "
+        "recommended sampler and the default here), or euler_ancestral (Euler a; ancestral renoise each "
+        "step, stochastic)",
     )
     parser.add_argument(
         "--scheduler",
         type=str,
         default="beta57",
         choices=list(SCHEDULER_OPTION_CHOICES),
-        help="sigma scheduler: default (flow-shifted linspace) or beta57 (RES4LYF beta alpha=0.5/beta=0.7, "
-        "more low-noise emphasis; the default here for Anima)",
+        help="sigma scheduler: default (flow-shifted linspace), beta57 (RES4LYF beta alpha=0.5/beta=0.7, "
+        "more low-noise emphasis; the default here for Anima), or simple (ComfyUI simple_scheduler, even "
+        "stride over the flow-shifted sigma table)",
     )
     parser.add_argument("--no_metadata", action="store_true", help="do not save metadata")
     parser.add_argument("--latent_path", type=str, nargs="*", default=None, help="path to latent for decode. no inference")
@@ -1032,6 +1034,8 @@ def generate_body(
     # Prepare sigmas according to the selected scheduler (flow sigmas in [0,1], descending to 0)
     if args.scheduler == "beta57":
         sigmas = anima_er_sde_sampling.build_beta57_sigmas(args.infer_steps, args.flow_shift, device)
+    elif args.scheduler == "simple":
+        sigmas = anima_er_sde_sampling.build_simple_sigmas(args.infer_steps, args.flow_shift, device)
     else:
         _timesteps, sigmas = hunyuan_image_utils.get_timesteps_sigmas(args.infer_steps, args.flow_shift, device)
 
@@ -1050,12 +1054,16 @@ def generate_body(
             velocity = uncond_velocity + args.guidance_scale * (velocity - uncond_velocity)
         return velocity
 
-    if args.sampler == "er_sde":
-        def predict_denoised_x0(current_latents, sigma_scalar):
-            velocity = run_velocity_with_cfg(current_latents, sigma_scalar).to(torch.float32)
-            return current_latents.to(torch.float32) - sigma_scalar.to(torch.float32) * velocity
+    def predict_denoised_x0(current_latents, sigma_scalar):
+        velocity = run_velocity_with_cfg(current_latents, sigma_scalar).to(torch.float32)
+        return current_latents.to(torch.float32) - sigma_scalar.to(torch.float32) * velocity
 
+    if args.sampler == "er_sde":
         latents = anima_er_sde_sampling.sample_er_sde_rectified_flow(
+            predict_denoised_x0, latents, sigmas, seed=args.seed
+        ).to(latents.dtype)
+    elif args.sampler == "euler_ancestral":
+        latents = anima_er_sde_sampling.sample_euler_ancestral_rectified_flow(
             predict_denoised_x0, latents, sigmas, seed=args.seed
         ).to(latents.dtype)
     else:

@@ -2,7 +2,10 @@ import argparse
 import json
 import os
 
+import torch
 from PIL import Image, PngImagePlugin
+
+from library import anima_er_sde_sampling
 
 from anima_minimal_inference import (
     SAMPLER_OPTION_CHOICES,
@@ -280,6 +283,58 @@ def test_stream_usable_skip_first_then_limit_paginates():
     usable_map = {k: {"prompt": k} for k in items}
     streamed = _collect_streamed(items, usable_map, prompt_count=2, skip_first=2)
     assert streamed == [(2, "c", {"prompt": "c"}), (3, "d", {"prompt": "d"})]
+
+
+def test_sampler_and_scheduler_choices_include_new_options():
+    assert "euler_ancestral" in SAMPLER_OPTION_CHOICES
+    assert "simple" in SCHEDULER_OPTION_CHOICES
+
+
+def test_build_simple_sigmas_descends_to_zero():
+    sigmas = anima_er_sde_sampling.build_simple_sigmas(10, 1.0, torch.device("cpu"))
+    assert len(sigmas) == 11  # steps + 1
+    assert float(sigmas[-1]) == 0.0
+    # strictly descending down to the trailing 0.0
+    values = [float(s) for s in sigmas]
+    assert all(values[i] > values[i + 1] for i in range(len(values) - 1)), values
+    # first sigma is near the max of the flow table (~1.0 at flow_shift 1.0)
+    assert 0.9 <= values[0] <= 1.0
+
+
+def test_build_simple_sigmas_varies_with_flow_shift():
+    a = anima_er_sde_sampling.build_simple_sigmas(20, 1.0, torch.device("cpu"))
+    b = anima_er_sde_sampling.build_simple_sigmas(20, 5.0, torch.device("cpu"))
+    assert not torch.equal(a, b)
+
+
+def test_euler_ancestral_identity_denoiser_no_eta_returns_input():
+    # denoised == x means zero velocity; with eta=0 no noise is added, so the latent is unchanged.
+    latents = torch.arange(6, dtype=torch.float32).reshape(1, 1, 1, 2, 3)
+    sigmas = torch.tensor([0.8, 0.5, 0.2, 0.0], dtype=torch.float32)
+
+    def identity_denoiser(current_latents, _sigma_scalar):
+        return current_latents
+
+    out = anima_er_sde_sampling.sample_euler_ancestral_rectified_flow(
+        identity_denoiser, latents.clone(), sigmas, seed=0, eta=0.0
+    )
+    assert torch.allclose(out, latents, atol=1e-5), out
+
+
+def test_euler_ancestral_seed_is_reproducible_and_seed_sensitive():
+    # Identity denoiser keeps the per-step ancestral noise in x through the terminal step, so the
+    # output reflects the seeded noise (a zero/constant denoiser would be zeroed by the final x=denoised).
+    latents = torch.zeros(1, 1, 1, 2, 3, dtype=torch.float32)
+    sigmas = torch.tensor([0.9, 0.6, 0.3, 0.0], dtype=torch.float32)
+
+    def identity_denoiser(current_latents, _sigma_scalar):
+        return current_latents
+
+    run_a = anima_er_sde_sampling.sample_euler_ancestral_rectified_flow(identity_denoiser, latents.clone(), sigmas, seed=42, eta=1.0)
+    run_b = anima_er_sde_sampling.sample_euler_ancestral_rectified_flow(identity_denoiser, latents.clone(), sigmas, seed=42, eta=1.0)
+    run_c = anima_er_sde_sampling.sample_euler_ancestral_rectified_flow(identity_denoiser, latents.clone(), sigmas, seed=99, eta=1.0)
+    assert torch.equal(run_a, run_b)  # same seed -> identical
+    assert not torch.equal(run_a, run_c)  # different seed -> different
 
 
 def test_map_metadata_value_to_script_option_matches_and_normalizes():

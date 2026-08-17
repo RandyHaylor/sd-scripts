@@ -58,6 +58,88 @@ def build_beta57_sigmas(
     return torch.tensor(selected_sigmas, dtype=torch.float32, device=device)
 
 
+def build_simple_sigmas(
+    num_inference_steps: int,
+    flow_shift: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """'simple' sigma schedule. Faithful port of ComfyUI comfy/samplers.py :: simple_scheduler,
+    indexing the rectified-flow shifted sigma table (so flow_shift still applies).
+
+    ComfyUI evenly strides the ascending model sigma table from the high-noise end:
+    sigmas[-(1 + int(x * len/steps))] for x in range(steps), then appends 0.0.
+    """
+    total_timesteps = 1000
+    sigma_table = [
+        compute_flow_shifted_sigma(flow_shift, (k + 1) / total_timesteps) for k in range(total_timesteps)
+    ]
+
+    step_stride = total_timesteps / num_inference_steps
+    selected_sigmas = [float(sigma_table[-(1 + int(x * step_stride))]) for x in range(num_inference_steps)]
+    selected_sigmas.append(0.0)
+    return torch.tensor(selected_sigmas, dtype=torch.float32, device=device)
+
+
+@torch.no_grad()
+def sample_euler_ancestral_rectified_flow(
+    predict_denoised_x0,
+    latents: torch.Tensor,
+    sigmas: torch.Tensor,
+    seed=None,
+    eta: float = 1.0,
+    s_noise: float = 1.0,
+) -> torch.Tensor:
+    """Ancestral Euler sampler for a rectified-flow (CONST) model.
+
+    Faithful port of ComfyUI comfy/k_diffusion/sampling.py :: sample_euler_ancestral_RF (the branch
+    used for CONST/flow models). Each step takes an Euler step toward a reduced sigma_down and, when
+    eta > 0, renoises to sigma_{i+1} with a seeded standard-normal sample.
+
+    Args:
+        predict_denoised_x0: callable(x, sigma_scalar_tensor) -> denoised x0 estimate (x - sigma * v).
+        latents: initial noise tensor.
+        sigmas: 1D tensor of length num_steps+1, flow sigmas descending to 0.0 at the end.
+        seed: optional int for the stochastic renoise.
+        eta: ancestral noise amount (1.0 = full ancestral, 0.0 = deterministic Euler).
+        s_noise: scale on injected noise.
+    """
+    device = latents.device
+
+    generator = None
+    if seed is not None:
+        generator = torch.Generator(device=device)
+        generator.manual_seed(int(seed))
+
+    def sample_standard_noise(reference: torch.Tensor) -> torch.Tensor:
+        return torch.randn(
+            reference.size(), dtype=reference.dtype, layout=reference.layout, device=device, generator=generator
+        )
+
+    sigmas = sigmas.to(device=device, dtype=torch.float32)
+    latents = latents.to(torch.float32)
+
+    for i in tqdm(range(len(sigmas) - 1), desc="Denoising steps (euler_ancestral)"):
+        denoised = predict_denoised_x0(latents, sigmas[i]).to(torch.float32)
+
+        if sigmas[i + 1] == 0:
+            latents = denoised
+        else:
+            downstep_ratio = 1 + (sigmas[i + 1] / sigmas[i] - 1) * eta
+            sigma_down = sigmas[i + 1] * downstep_ratio
+            alpha_ip1 = 1 - sigmas[i + 1]
+            alpha_down = 1 - sigma_down
+            renoise_coeff = (sigmas[i + 1] ** 2 - sigma_down ** 2 * alpha_ip1 ** 2 / alpha_down ** 2) ** 0.5
+
+            # Euler step to sigma_down (expressed via the x0 estimate)
+            sigma_down_i_ratio = sigma_down / sigmas[i]
+            latents = sigma_down_i_ratio * latents + (1 - sigma_down_i_ratio) * denoised
+
+            if eta > 0:
+                latents = (alpha_ip1 / alpha_down) * latents + sample_standard_noise(latents) * s_noise * renoise_coeff
+
+    return latents
+
+
 @torch.no_grad()
 def sample_er_sde_rectified_flow(
     predict_denoised_x0,
