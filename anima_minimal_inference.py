@@ -117,6 +117,15 @@ def parse_args() -> argparse.Namespace:
         "default 1.0). Use shell line-continuation to put one 'path multiplier' per line. Populates "
         "--lora_weight/--lora_multiplier.",
     )
+    parser.add_argument(
+        "--record_lora_rows_json",
+        type=str,
+        default=None,
+        help="JSON array of {path, multiplier, enabled} recorded VERBATIM into the settings sidecar's 'loras' "
+        "(including disabled rows), so a GUI can restore the full LoRA list on reload. Record-only: these are "
+        "NOT merged (only --lora_list/--lora_weight are). When absent, the sidecar derives its loras from the "
+        "merged LoRAs, all marked enabled.",
+    )
     parser.add_argument("--include_patterns", type=str, nargs="*", default=None, help="LoRA module include patterns")
     parser.add_argument("--exclude_patterns", type=str, nargs="*", default=None, help="LoRA module exclude patterns")
     parser.add_argument(
@@ -2021,6 +2030,48 @@ def build_png_generation_metadata_text(args) -> str:
     return f"{args.prompt}\nNegative prompt: {args.negative_prompt}\n{settings_line}"
 
 
+def build_recorded_lora_rows(args) -> list:
+    """Return the LoRA rows to record in the settings sidecar as [{path, multiplier, enabled}, ...].
+
+    Prefers the GUI's verbatim --record_lora_rows_json (which preserves disabled rows and order); falls
+    back to the merged --lora_weight/--lora_multiplier (all marked enabled) for plain CLI runs. Returns
+    [] when there are no LoRAs.
+    """
+    recorded_rows_json = getattr(args, "record_lora_rows_json", None)
+    if recorded_rows_json:
+        try:
+            parsed_rows = json.loads(recorded_rows_json)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(f"Ignoring unparseable --record_lora_rows_json: {recorded_rows_json!r}")
+            parsed_rows = None
+        if isinstance(parsed_rows, list):
+            normalized_rows = []
+            for row in parsed_rows:
+                if not isinstance(row, dict) or not row.get("path"):
+                    continue
+                normalized_rows.append(
+                    {
+                        "path": row["path"],
+                        "multiplier": row.get("multiplier", 1.0),
+                        "enabled": bool(row.get("enabled", True)),
+                    }
+                )
+            return normalized_rows
+
+    if getattr(args, "lora_weight", None):
+        multipliers = args.lora_multiplier if isinstance(args.lora_multiplier, list) else [args.lora_multiplier]
+        return [
+            {
+                "path": lora_path,
+                "multiplier": multipliers[lora_index] if lora_index < len(multipliers) else 1.0,
+                "enabled": True,
+            }
+            for lora_index, lora_path in enumerate(args.lora_weight)
+        ]
+
+    return []
+
+
 def build_generation_settings_dict(args) -> dict:
     """Return the generation settings for one image as a structured dict, for the JSON sidecar and for
     reloading into the GUI. Optional keys (loras/source_image/test_lora) are included only when present."""
@@ -2041,15 +2092,9 @@ def build_generation_settings_dict(args) -> dict:
         "text_encoder": args.text_encoder,
     }
 
-    if getattr(args, "lora_weight", None):
-        multipliers = args.lora_multiplier if isinstance(args.lora_multiplier, list) else [args.lora_multiplier]
-        settings["loras"] = [
-            {
-                "path": lora_path,
-                "multiplier": multipliers[lora_index] if lora_index < len(multipliers) else 1.0,
-            }
-            for lora_index, lora_path in enumerate(args.lora_weight)
-        ]
+    recorded_lora_rows = build_recorded_lora_rows(args)
+    if recorded_lora_rows:
+        settings["loras"] = recorded_lora_rows
 
     source_image_path = getattr(args, "current_source_image_path", None)
     if source_image_path:

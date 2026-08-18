@@ -884,15 +884,42 @@ def test_generation_settings_dict_has_core_fields_with_width_and_height_separate
     assert "test_lora" not in settings
 
 
-def test_generation_settings_dict_includes_structured_loras_when_present():
+def test_generation_settings_dict_includes_merged_loras_marked_enabled_when_no_record_json():
     args = build_minimal_generation_args_namespace()
     args.lora_weight = ["/loras/a.safetensors", "/loras/b.safetensors"]
     args.lora_multiplier = [0.8, 1.0]
     settings = build_generation_settings_dict(args)
     assert settings["loras"] == [
-        {"path": "/loras/a.safetensors", "multiplier": 0.8},
-        {"path": "/loras/b.safetensors", "multiplier": 1.0},
+        {"path": "/loras/a.safetensors", "multiplier": 0.8, "enabled": True},
+        {"path": "/loras/b.safetensors", "multiplier": 1.0, "enabled": True},
     ]
+
+
+def test_generation_settings_dict_records_disabled_lora_rows_from_record_json():
+    args = build_minimal_generation_args_namespace()
+    # Only the enabled row was merged, but the record JSON carries the full ordered list.
+    args.lora_weight = ["/loras/enabled.safetensors"]
+    args.lora_multiplier = [1.0]
+    args.record_lora_rows_json = json.dumps(
+        [
+            {"path": "/loras/enabled.safetensors", "multiplier": 1.0, "enabled": True},
+            {"path": "/loras/disabled.safetensors", "multiplier": 0.5, "enabled": False},
+        ]
+    )
+    settings = build_generation_settings_dict(args)
+    assert settings["loras"] == [
+        {"path": "/loras/enabled.safetensors", "multiplier": 1.0, "enabled": True},
+        {"path": "/loras/disabled.safetensors", "multiplier": 0.5, "enabled": False},
+    ]
+
+
+def test_generation_settings_dict_ignores_unparseable_record_json_and_falls_back_to_merged():
+    args = build_minimal_generation_args_namespace()
+    args.lora_weight = ["/loras/a.safetensors"]
+    args.lora_multiplier = [1.0]
+    args.record_lora_rows_json = "{not valid json"
+    settings = build_generation_settings_dict(args)
+    assert settings["loras"] == [{"path": "/loras/a.safetensors", "multiplier": 1.0, "enabled": True}]
 
 
 def test_generation_settings_dict_records_source_image_and_test_lora_when_set():
