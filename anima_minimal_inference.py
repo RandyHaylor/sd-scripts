@@ -2021,41 +2021,54 @@ def build_png_generation_metadata_text(args) -> str:
     return f"{args.prompt}\nNegative prompt: {args.negative_prompt}\n{settings_line}"
 
 
-def write_generation_settings_sidecar(save_path: str, image_name: str, args) -> None:
-    """Write '<image_name>.txt' next to the PNG recording the generation settings for reproducibility."""
+def build_generation_settings_dict(args) -> dict:
+    """Return the generation settings for one image as a structured dict, for the JSON sidecar and for
+    reloading into the GUI. Optional keys (loras/source_image/test_lora) are included only when present."""
     image_height, image_width = args.image_size[0], args.image_size[1]
-    settings_lines = [
-        f"prompt: {args.prompt}",
-        f"negative_prompt: {args.negative_prompt}",
-        f"width: {image_width}",
-        f"height: {image_height}",
-        f"steps: {args.infer_steps}",
-        f"guidance_scale: {args.guidance_scale}",
-        f"flow_shift: {args.flow_shift}",
-        f"seed: {args.seed}",
-        f"sampler: {args.sampler}",
-        f"scheduler: {args.scheduler}",
-        f"dit: {args.dit}",
-        f"vae: {args.vae}",
-        f"text_encoder: {args.text_encoder}",
-    ]
+    settings = {
+        "prompt": args.prompt,
+        "negative_prompt": args.negative_prompt,
+        "width": image_width,
+        "height": image_height,
+        "steps": args.infer_steps,
+        "guidance_scale": args.guidance_scale,
+        "flow_shift": args.flow_shift,
+        "seed": args.seed,
+        "sampler": args.sampler,
+        "scheduler": args.scheduler,
+        "dit": args.dit,
+        "vae": args.vae,
+        "text_encoder": args.text_encoder,
+    }
+
     if getattr(args, "lora_weight", None):
         multipliers = args.lora_multiplier if isinstance(args.lora_multiplier, list) else [args.lora_multiplier]
-        for lora_index, lora_path in enumerate(args.lora_weight):
-            multiplier = multipliers[lora_index] if lora_index < len(multipliers) else 1.0
-            settings_lines.append(f"lora: {lora_path} {multiplier}")
+        settings["loras"] = [
+            {
+                "path": lora_path,
+                "multiplier": multipliers[lora_index] if lora_index < len(multipliers) else 1.0,
+            }
+            for lora_index, lora_path in enumerate(args.lora_weight)
+        ]
 
     source_image_path = getattr(args, "current_source_image_path", None)
     if source_image_path:
-        settings_lines.append(f"source_image: {source_image_path}")
+        settings["source_image"] = source_image_path
 
     test_lora = getattr(args, "current_test_lora", None)
     if test_lora:
-        settings_lines.append(f"test_lora: {test_lora}")
+        settings["test_lora"] = test_lora
 
-    settings_path = os.path.join(save_path, f"{image_name}.txt")
+    return settings
+
+
+def write_generation_settings_sidecar(save_path: str, image_name: str, args) -> None:
+    """Write '<image_name>.json' next to the PNG recording the generation settings for reproducibility
+    and for reloading into the GUI."""
+    settings_path = os.path.join(save_path, f"{image_name}.json")
     with open(settings_path, "w", encoding="utf-8") as settings_file:
-        settings_file.write("\n".join(settings_lines) + "\n")
+        json.dump(build_generation_settings_dict(args), settings_file, indent=2, ensure_ascii=False)
+        settings_file.write("\n")
     logger.info(f"Settings saved to: {settings_path}")
 
 

@@ -13,6 +13,7 @@ from anima_minimal_inference import (
     apply_image_embed_settings_gate,
     apply_pre_prompt_to_batch_prompts,
     build_args_for_test_lora,
+    build_generation_settings_dict,
     build_repeated_single_prompt_data,
     convert_peft_diffusion_model_lora_keys,
     select_dit_lora_state_dict,
@@ -848,6 +849,59 @@ def test_normalize_from_image_embed_rejects_extra_tokens():
     except ValueError:
         return
     raise AssertionError("expected ValueError for multiple folder paths")
+
+
+def build_minimal_generation_args_namespace():
+    return argparse.Namespace(
+        prompt="a bunny",
+        negative_prompt="low quality",
+        image_size=[1216, 832],  # [height, width]
+        infer_steps=50,
+        guidance_scale=3.5,
+        flow_shift=5.0,
+        seed=42,
+        sampler="er_sde",
+        scheduler="beta57",
+        dit="/models/dit.safetensors",
+        vae="/models/vae.safetensors",
+        text_encoder="/models/te.safetensors",
+    )
+
+
+def test_generation_settings_dict_has_core_fields_with_width_and_height_separated():
+    settings = build_generation_settings_dict(build_minimal_generation_args_namespace())
+    assert settings["prompt"] == "a bunny"
+    assert settings["negative_prompt"] == "low quality"
+    assert settings["width"] == 832 and settings["height"] == 1216
+    assert settings["steps"] == 50
+    assert settings["guidance_scale"] == 3.5
+    assert settings["seed"] == 42
+    assert settings["sampler"] == "er_sde" and settings["scheduler"] == "beta57"
+    assert settings["dit"].endswith("dit.safetensors")
+    # Optional keys are absent when not applicable.
+    assert "loras" not in settings
+    assert "source_image" not in settings
+    assert "test_lora" not in settings
+
+
+def test_generation_settings_dict_includes_structured_loras_when_present():
+    args = build_minimal_generation_args_namespace()
+    args.lora_weight = ["/loras/a.safetensors", "/loras/b.safetensors"]
+    args.lora_multiplier = [0.8, 1.0]
+    settings = build_generation_settings_dict(args)
+    assert settings["loras"] == [
+        {"path": "/loras/a.safetensors", "multiplier": 0.8},
+        {"path": "/loras/b.safetensors", "multiplier": 1.0},
+    ]
+
+
+def test_generation_settings_dict_records_source_image_and_test_lora_when_set():
+    args = build_minimal_generation_args_namespace()
+    args.current_source_image_path = "/refs/reference.png"
+    args.current_test_lora = "/loras/test.safetensors 1.0"
+    settings = build_generation_settings_dict(args)
+    assert settings["source_image"] == "/refs/reference.png"
+    assert settings["test_lora"] == "/loras/test.safetensors 1.0"
 
 
 if __name__ == "__main__":
