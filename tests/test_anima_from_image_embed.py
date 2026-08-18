@@ -13,6 +13,7 @@ from anima_minimal_inference import (
     apply_image_embed_settings_gate,
     apply_pre_prompt_to_batch_prompts,
     build_args_for_test_lora,
+    build_repeated_single_prompt_data,
     convert_peft_diffusion_model_lora_keys,
     select_dit_lora_state_dict,
     build_png_generation_metadata_text,
@@ -329,6 +330,19 @@ def test_select_dit_lora_converts_peft_when_no_unet_keys():
         "blocks_0_cross_attn_q_proj.lora_down.weight": "A",
         "blocks_0_cross_attn_q_proj.lora_up.weight": "B",
     }
+
+
+def test_build_repeated_single_prompt_data_increments_seed():
+    data = build_repeated_single_prompt_data("a cat", 42, 3)
+    assert data == [
+        {"prompt": "a cat", "seed": 42},
+        {"prompt": "a cat", "seed": 43},
+        {"prompt": "a cat", "seed": 44},
+    ]
+
+
+def test_build_repeated_single_prompt_data_minimum_one():
+    assert build_repeated_single_prompt_data("p", 7, 0) == [{"prompt": "p", "seed": 7}]
 
 
 def test_apply_pre_prompt_to_batch_prompts():

@@ -1321,6 +1321,15 @@ def preprocess_prompts_for_batch(prompt_lines: List[str], base_args: argparse.Na
     return prompts_data
 
 
+def build_repeated_single_prompt_data(prompt: str, base_seed: int, images_per_prompt: int) -> List[Dict]:
+    """Return prompts_data (for process_batch_prompts) that renders images_per_prompt copies of one
+    prompt with consecutive seeds base_seed, base_seed+1, ... So single-prompt mode can produce N
+    seed-incremented images in a single run (one model load), matching --images_per_prompt elsewhere.
+    """
+    count = max(1, images_per_prompt)
+    return [{"prompt": prompt, "seed": base_seed + iteration} for iteration in range(count)]
+
+
 def apply_pre_prompt_to_batch_prompts(
     prompts_data: List[Dict], pre_prompt_prefix: str, pre_prompt_negative: str
 ) -> List[Dict]:
@@ -2088,31 +2097,15 @@ def dispatch_generation(args: argparse.Namespace) -> None:
         process_interactive(args)
 
     else:
-        # Single prompt mode (original behavior)
-        gen_settings = get_generation_settings(args)
-
+        # Single prompt mode. Route through the batch path so --images_per_prompt N renders N
+        # seed-incremented images in ONE run (single model load), and the settings sidecar is written
+        # before each generation.
         if prompt_prefix and args.prompt is not None:
             args.prompt = f"{prompt_prefix} {args.prompt}".strip()
 
-        # Resolve the seed and reserve the image base name up front so the settings sidecar is written
-        # BEFORE generation starts (readable while the image renders), matching the batch modes.
-        args.seed = resolve_random_seed(args.seed)
-        image_base_name = f"{get_time_flag()}_{args.seed}"
-        if args.output_type != "latent":
-            os.makedirs(args.save_path, exist_ok=True)
-            write_generation_settings_sidecar(args.save_path, image_base_name, args)
-
-        # For single mode, precomputed data is None, shared_models is None.
-        # generate will load all necessary models (Text Encoders, DiT).
-        latent = generate(args, gen_settings)
-
-        clean_memory_on_device(args.device)
-
-        # Save latent and video
-        vae = anima_train_utils.load_qwen_image_vae(args, device="cpu", disable_mmap=True)
-        vae.to(torch.bfloat16)
-        vae.eval()
-        save_output(args, vae, latent, args.device, precomputed_image_name=image_base_name)
+        base_seed = resolve_random_seed(args.seed)
+        prompts_data = build_repeated_single_prompt_data(args.prompt, base_seed, args.images_per_prompt)
+        process_batch_prompts(prompts_data, args)
 
 
 def run_lora_test_sweep(args: argparse.Namespace) -> None:
