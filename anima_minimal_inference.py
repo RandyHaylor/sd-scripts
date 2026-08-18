@@ -1287,6 +1287,25 @@ def preprocess_prompts_for_batch(prompt_lines: List[str], base_args: argparse.Na
     return prompts_data
 
 
+def apply_pre_prompt_to_batch_prompts(
+    prompts_data: List[Dict], pre_prompt_prefix: str, pre_prompt_negative: str
+) -> List[Dict]:
+    """Apply --pre_prompt / --pre_prompt_neg to a --from_file batch (mutates and returns prompts_data).
+
+    pre_prompt_prefix is prepended to each prompt; pre_prompt_negative is used as the negative for any
+    line that does not already specify one (a per-line '--n' negative is preserved). Both are no-ops
+    when empty.
+    """
+    prefix = (pre_prompt_prefix or "").strip()
+    negative = (pre_prompt_negative or "").strip()
+    for prompt_data in prompts_data:
+        if prefix:
+            prompt_data["prompt"] = f"{prefix} {prompt_data['prompt']}".strip()
+        if negative and not prompt_data.get("negative_prompt"):
+            prompt_data["negative_prompt"] = negative
+    return prompts_data
+
+
 def load_shared_models(args: argparse.Namespace) -> Dict:
     """Load shared models for batch processing or interactive mode.
     Models are loaded to CPU to save memory. VAE is NOT loaded here.
@@ -2002,7 +2021,9 @@ def dispatch_generation(args: argparse.Namespace) -> None:
     interactive / single --prompt). Applies the test-LoRA prompt prefix to from_file / single --prompt
     (the modes that have no --pre_prompt of their own) when set by the LoRA test sweep.
     """
-    prompt_prefix = getattr(args, "lora_test_prompt_prefix", "")
+    # In the LoRA test sweep the composed prefix (which already folds in --pre_prompt) is set on
+    # lora_test_prompt_prefix; otherwise fall back to the user's --pre_prompt for --from_file.
+    prompt_prefix = getattr(args, "lora_test_prompt_prefix", "") or args.pre_prompt.strip()
 
     if args.from_folder:
         # Streaming mode: one caption file at a time (settings txt -> generate -> save -> next)
@@ -2020,9 +2041,7 @@ def dispatch_generation(args: argparse.Namespace) -> None:
         # prompts_data is already the usable list (blank/comment lines removed), so skip_first +
         # prompt_count paginate it directly by index.
         prompts_data = preprocess_prompts_for_batch(prompt_lines, args)
-        if prompt_prefix:
-            for prompt_data in prompts_data:
-                prompt_data["prompt"] = f"{prompt_prefix} {prompt_data['prompt']}".strip()
+        apply_pre_prompt_to_batch_prompts(prompts_data, prompt_prefix, args.pre_prompt_neg)
         skip_first = max(0, args.prompt_count_skip_first)
         if args.prompt_count is not None:
             prompts_data = prompts_data[skip_first : skip_first + max(0, args.prompt_count)]

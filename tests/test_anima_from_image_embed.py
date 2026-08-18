@@ -11,6 +11,7 @@ from anima_minimal_inference import (
     SAMPLER_OPTION_CHOICES,
     SCHEDULER_OPTION_CHOICES,
     apply_image_embed_settings_gate,
+    apply_pre_prompt_to_batch_prompts,
     build_args_for_test_lora,
     build_png_generation_metadata_text,
     COMBINED_CHECKPOINT_COMPONENTS,
@@ -283,6 +284,24 @@ def test_stream_usable_skip_first_then_limit_paginates():
     usable_map = {k: {"prompt": k} for k in items}
     streamed = _collect_streamed(items, usable_map, prompt_count=2, skip_first=2)
     assert streamed == [(2, "c", {"prompt": "c"}), (3, "d", {"prompt": "d"})]
+
+
+def test_apply_pre_prompt_to_batch_prompts():
+    prompts_data = [
+        {"prompt": "a cat"},
+        {"prompt": "a dog", "negative_prompt": "leash"},  # keeps its own negative
+    ]
+    apply_pre_prompt_to_batch_prompts(prompts_data, "masterpiece", "worst quality")
+    assert prompts_data[0]["prompt"] == "masterpiece a cat"
+    assert prompts_data[0]["negative_prompt"] == "worst quality"  # line had none -> pre_prompt_neg used
+    assert prompts_data[1]["prompt"] == "masterpiece a dog"
+    assert prompts_data[1]["negative_prompt"] == "leash"  # per-line negative preserved
+
+
+def test_apply_pre_prompt_empty_is_noop():
+    prompts_data = [{"prompt": "a cat"}]
+    apply_pre_prompt_to_batch_prompts(prompts_data, "", "")
+    assert prompts_data[0] == {"prompt": "a cat"}
 
 
 def test_sampler_and_scheduler_choices_include_new_options():
