@@ -2041,6 +2041,14 @@ def dispatch_generation(args: argparse.Namespace) -> None:
         if prompt_prefix and args.prompt is not None:
             args.prompt = f"{prompt_prefix} {args.prompt}".strip()
 
+        # Resolve the seed and reserve the image base name up front so the settings sidecar is written
+        # BEFORE generation starts (readable while the image renders), matching the batch modes.
+        args.seed = resolve_random_seed(args.seed)
+        image_base_name = f"{get_time_flag()}_{args.seed}"
+        if args.output_type != "latent":
+            os.makedirs(args.save_path, exist_ok=True)
+            write_generation_settings_sidecar(args.save_path, image_base_name, args)
+
         # For single mode, precomputed data is None, shared_models is None.
         # generate will load all necessary models (Text Encoders, DiT).
         latent = generate(args, gen_settings)
@@ -2051,7 +2059,7 @@ def dispatch_generation(args: argparse.Namespace) -> None:
         vae = anima_train_utils.load_qwen_image_vae(args, device="cpu", disable_mmap=True)
         vae.to(torch.bfloat16)
         vae.eval()
-        save_output(args, vae, latent, args.device)
+        save_output(args, vae, latent, args.device, precomputed_image_name=image_base_name)
 
 
 def run_lora_test_sweep(args: argparse.Namespace) -> None:
