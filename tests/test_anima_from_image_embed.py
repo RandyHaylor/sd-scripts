@@ -13,6 +13,8 @@ from anima_minimal_inference import (
     apply_image_embed_settings_gate,
     apply_pre_prompt_to_batch_prompts,
     build_args_for_test_lora,
+    convert_peft_diffusion_model_lora_keys,
+    select_dit_lora_state_dict,
     build_png_generation_metadata_text,
     COMBINED_CHECKPOINT_COMPONENTS,
     compose_pre_prompt_with_lora_injection,
@@ -284,6 +286,49 @@ def test_stream_usable_skip_first_then_limit_paginates():
     usable_map = {k: {"prompt": k} for k in items}
     streamed = _collect_streamed(items, usable_map, prompt_count=2, skip_first=2)
     assert streamed == [(2, "c", {"prompt": "c"}), (3, "d", {"prompt": "d"})]
+
+
+def test_convert_peft_diffusion_model_lora_keys():
+    lora_sd = {
+        "diffusion_model.blocks.0.adaln_modulation_cross_attn.1.lora_A.weight": "A",
+        "diffusion_model.blocks.0.adaln_modulation_cross_attn.1.lora_B.weight": "B",
+        "diffusion_model.blocks.0.adaln_modulation_cross_attn.1.alpha": "alpha",
+    }
+    converted = convert_peft_diffusion_model_lora_keys(lora_sd)
+    assert converted == {
+        "blocks_0_adaln_modulation_cross_attn_1.lora_down.weight": "A",  # lora_A -> lora_down
+        "blocks_0_adaln_modulation_cross_attn_1.lora_up.weight": "B",  # lora_B -> lora_up
+        "blocks_0_adaln_modulation_cross_attn_1.alpha": "alpha",
+    }
+
+
+def test_convert_peft_ignores_non_diffusion_model_keys():
+    assert convert_peft_diffusion_model_lora_keys({"lora_unet_blocks_0.lora_down.weight": "x"}) == {}
+
+
+def test_select_dit_lora_prefers_kohya_unet_keys():
+    lora_sd = {
+        "lora_unet_blocks_0_cross_attn_k_proj.lora_down.weight": "d",
+        "lora_unet_blocks_0_cross_attn_k_proj.lora_up.weight": "u",
+        "lora_te_something.lora_down.weight": "te",  # text-encoder keys are not kept for the DiT
+    }
+    selected = select_dit_lora_state_dict(lora_sd)
+    assert selected == {
+        "lora_unet_blocks_0_cross_attn_k_proj.lora_down.weight": "d",
+        "lora_unet_blocks_0_cross_attn_k_proj.lora_up.weight": "u",
+    }
+
+
+def test_select_dit_lora_converts_peft_when_no_unet_keys():
+    lora_sd = {
+        "diffusion_model.blocks.0.cross_attn.q_proj.lora_A.weight": "A",
+        "diffusion_model.blocks.0.cross_attn.q_proj.lora_B.weight": "B",
+    }
+    selected = select_dit_lora_state_dict(lora_sd)
+    assert selected == {
+        "blocks_0_cross_attn_q_proj.lora_down.weight": "A",
+        "blocks_0_cross_attn_q_proj.lora_up.weight": "B",
+    }
 
 
 def test_apply_pre_prompt_to_batch_prompts():

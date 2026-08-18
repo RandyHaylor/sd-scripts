@@ -702,6 +702,40 @@ def check_inputs(args: argparse.Namespace) -> Tuple[int, int]:
 # region Model
 
 
+def convert_peft_diffusion_model_lora_keys(lora_sd: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert ComfyUI/PEFT LoRA keys to the down/up/alpha form the DiT merge hook expects.
+
+    ComfyUI/PEFT LoRAs name keys 'diffusion_model.<module>.lora_A.weight' / '.lora_B.weight' / '.alpha'.
+    The merge (library.lora_utils) matches a bare model weight key by replacing '.' with '_' and looking
+    for '<name>.lora_down.weight' / '.lora_up.weight' / '.alpha' (empty prefix). So we strip
+    'diffusion_model.', underscore the module path, and map lora_A->lora_down, lora_B->lora_up.
+    Keys not matching these suffixes (or lacking the prefix) are skipped.
+    """
+    converted: Dict[str, Any] = {}
+    for key, value in lora_sd.items():
+        if not key.startswith("diffusion_model."):
+            continue
+        module_and_suffix = key[len("diffusion_model.") :]
+        for source_suffix, target_suffix in ((".lora_A.weight", ".lora_down.weight"), (".lora_B.weight", ".lora_up.weight"), (".alpha", ".alpha")):
+            if module_and_suffix.endswith(source_suffix):
+                module_path = module_and_suffix[: -len(source_suffix)]
+                converted[module_path.replace(".", "_") + target_suffix] = value
+                break
+    return converted
+
+
+def select_dit_lora_state_dict(lora_sd: Dict[str, Any]) -> Dict[str, Any]:
+    """Auto-detect the LoRA format and return DiT LoRA weights in the merge's expected form.
+
+    Prefers kohya 'lora_unet_' keys when present; otherwise converts ComfyUI/PEFT 'diffusion_model.'
+    LoRAs. Returns an empty dict if neither format is found.
+    """
+    kohya_unet_lora_sd = {k: v for k, v in lora_sd.items() if k.startswith("lora_unet_")}
+    if kohya_unet_lora_sd:
+        return kohya_unet_lora_sd
+    return convert_peft_diffusion_model_lora_keys(lora_sd)
+
+
 def load_dit_model(
     args: argparse.Namespace, device: torch.device, dit_weight_dtype: Optional[torch.dtype] = None
 ) -> anima_models.Anima:
@@ -727,8 +761,8 @@ def load_dit_model(
         for lora_weight in args.lora_weight:
             logger.info(f"Loading LoRA weight from: {lora_weight}")
             lora_sd = load_file(lora_weight)  # load on CPU, dtype is as is
-            # lora_sd = filter_lora_state_dict(lora_sd, args.include_patterns, args.exclude_patterns)
-            lora_sd = {k: v for k, v in lora_sd.items() if k.startswith("lora_unet_")}  # only keep unet lora weights
+            # Keep kohya 'lora_unet_' keys, or auto-convert ComfyUI/PEFT 'diffusion_model.' LoRAs.
+            lora_sd = select_dit_lora_state_dict(lora_sd)
             lora_weights_list.append(lora_sd)
     else:
         lora_weights_list = None
