@@ -309,6 +309,29 @@ def parse_args() -> argparse.Namespace:
         f"only the denoise loop (the heavy, sustained GPU cost). '{GPU_LOCK_SCOPE_ALL_COMPUTE}' also locks "
         "text-encode and VAE-decode, so exactly one process touches the GPU at any instant.",
     )
+    # Anima-Safe PAG (Perturbed Attention Guidance): perturb selected self-attention blocks toward the
+    # value path on an extra forward pass and steer the CFG result away from that weak prediction.
+    parser.add_argument("--pag", action="store_true", help="Enable Anima-Safe PAG (default off)")
+    parser.add_argument("--pag_scale", type=float, default=4.0, help="PAG correction strength (default 4.0)")
+    parser.add_argument(
+        "--pag_block_indices", type=str, default="18",
+        help="Transformer block(s) to perturb: index, comma list, or range (e.g. '18', '18,20', '18-22'). Default '18'.",
+    )
+    parser.add_argument(
+        "--pag_perturbation_strength", type=float, default=0.75,
+        help="Blend amount (0..1) from normal self-attention toward the value/identity path (default 0.75)",
+    )
+    parser.add_argument(
+        "--pag_head_indices", type=str, default="",
+        help="Optional attention-head filter (index/list/range); empty = all heads (default empty)",
+    )
+    parser.add_argument("--pag_start_percent", type=float, default=0.0, help="PAG active range start as sampling progress fraction (default 0.0)")
+    parser.add_argument("--pag_end_percent", type=float, default=0.7, help="PAG active range end as sampling progress fraction (default 0.7)")
+    parser.add_argument("--pag_rescale", type=float, default=0.20, help="PAG guidance rescale amount for contrast control (default 0.20)")
+    parser.add_argument(
+        "--pag_rescale_mode", type=str, default="full", choices=("full", "partial"),
+        help="PAG rescale strategy: 'full' (vs cfg result) or 'partial' (vs conditional). Default 'full'.",
+    )
 
     args = parser.parse_args()
 
@@ -1221,17 +1244,45 @@ def generate_body(
     do_cfg = args.guidance_scale != 1.0
     autocast_enabled = args.fp8
 
+    # Anima-Safe PAG config (parsed once): when enabled, active steps run an extra perturbed forward.
+    pag_enabled = bool(getattr(args, "pag", False))
+    pag_block_indices = parse_pag_index_spec(getattr(args, "pag_block_indices", "")) if pag_enabled else []
+    pag_head_indices = parse_pag_index_spec(getattr(args, "pag_head_indices", "")) or None  # empty = all heads
+    pag_scale = float(getattr(args, "pag_scale", 0.0))
+    pag_perturbation_strength = float(getattr(args, "pag_perturbation_strength", 0.0))
+    pag_start_percent = float(getattr(args, "pag_start_percent", 0.0))
+    pag_end_percent = float(getattr(args, "pag_end_percent", 1.0))
+    pag_rescale = float(getattr(args, "pag_rescale", 0.0))
+    pag_rescale_mode = str(getattr(args, "pag_rescale_mode", "full"))
+    pag_can_run = pag_enabled and pag_scale != 0.0 and len(pag_block_indices) > 0
+
     def run_velocity_with_cfg(current_latents, sigma_scalar):
         # The Anima DiT consumes the flow sigma (in [0,1]) directly as its time input.
         time_input = sigma_scalar.to(device=device, dtype=torch.bfloat16).expand(current_latents.shape[0])
         model_input = current_latents.to(torch.bfloat16)
         with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
-            velocity = anima(model_input, time_input, embed, padding_mask=padding_mask)
+            cond_velocity = anima(model_input, time_input, embed, padding_mask=padding_mask)
         if do_cfg:
             with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
                 uncond_velocity = anima(model_input, time_input, negative_embed, padding_mask=padding_mask)
-            velocity = uncond_velocity + args.guidance_scale * (velocity - uncond_velocity)
-        return velocity
+            cfg_velocity = uncond_velocity + args.guidance_scale * (cond_velocity - uncond_velocity)
+        else:
+            cfg_velocity = cond_velocity
+
+        # Anima-Safe PAG: on active steps, run one extra conditional pass with selected self-attention
+        # blocks perturbed toward the value path, then steer the CFG result away from that weak prediction.
+        if pag_can_run and pag_is_active_for_sigma(sigma_scalar, sigmas, pag_start_percent, pag_end_percent):
+            anima.enable_soft_pag_perturbation(pag_block_indices, pag_perturbation_strength, pag_head_indices)
+            try:
+                with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
+                    pag_velocity = anima(model_input, time_input, embed, padding_mask=padding_mask)
+            finally:
+                anima.disable_soft_pag_perturbation()
+            pag_guidance = (cond_velocity - pag_velocity) * pag_scale
+            cfg_velocity = cfg_velocity + rescale_pag_guidance(
+                pag_guidance, cond_velocity, cfg_velocity, pag_rescale, pag_rescale_mode
+            )
+        return cfg_velocity
 
     def predict_denoised_x0(current_latents, sigma_scalar):
         velocity = run_velocity_with_cfg(current_latents, sigma_scalar).to(torch.float32)
@@ -1295,6 +1346,69 @@ def resolve_random_seed(seed_value: Optional[int]) -> int:
     if seed_value is None or seed_value == -1:
         return random.randint(0, 2**32 - 1)
     return seed_value
+
+
+def parse_pag_index_spec(spec) -> List[int]:
+    """Parse an Anima-Safe PAG index spec (blocks or heads) into a sorted, de-duplicated int list.
+
+    Accepts a single index ("18"), a comma-separated list ("18,20,22"), inclusive ranges ("18-22"),
+    or a mix ("0,4-6"). Empty / None yields an empty list (caller treats empty head list as 'all heads').
+    """
+    if spec is None:
+        return []
+    indices: List[int] = []
+    for token in str(spec).split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token.lstrip("-"):  # a range like 18-22 (not a bare negative number)
+            low_text, high_text = token.split("-", 1)
+            low_index, high_index = int(low_text), int(high_text)
+            step = 1 if high_index >= low_index else -1
+            indices.extend(range(low_index, high_index + step, step))
+        else:
+            indices.append(int(token))
+    return sorted(set(indices))
+
+
+def pag_is_active_for_sigma(current_sigma, sigmas, start_percent: float, end_percent: float) -> bool:
+    """Whether PAG is active at current_sigma, given the descending flow-sigma schedule and the
+    start/end progress fractions. start_percent/end_percent are mapped to sigma thresholds by their
+    index into the schedule, and PAG is active while current_sigma lies within that [end, start] window.
+    """
+    schedule_length = len(sigmas)
+    if schedule_length < 2:
+        return False
+    num_steps = schedule_length - 1
+
+    def sigma_at_progress(progress_percent: float) -> float:
+        clamped = max(0.0, min(1.0, float(progress_percent)))
+        index = int(round(clamped * num_steps))
+        index = max(0, min(schedule_length - 1, index))
+        return float(sigmas[index])
+
+    start_sigma = sigma_at_progress(start_percent)
+    end_sigma = sigma_at_progress(end_percent)
+    window_high = max(start_sigma, end_sigma)
+    window_low = min(start_sigma, end_sigma)
+    sigma_value = float(current_sigma)
+    epsilon = 1e-6
+    return (sigma_value <= window_high + epsilon) and (sigma_value >= window_low - epsilon)
+
+
+def rescale_pag_guidance(pag_guidance, cond_prediction, cfg_result, rescale: float, rescale_mode: str):
+    """Std-normalize the PAG guidance term (contrast control), a faithful port of the ComfyUI node's
+    `_rescale_guidance`. Returns the (possibly rescaled) guidance to ADD to cfg_result. rescale=0 returns
+    the guidance unchanged; 'full' normalizes against cfg_result+guidance, 'partial' against
+    cond_prediction+guidance.
+    """
+    guidance_result = (cfg_result + pag_guidance) if rescale_mode == "full" else (cond_prediction + pag_guidance)
+    reduce_dims = tuple(range(1, guidance_result.ndim))
+    std_cond = torch.std(cond_prediction, dim=reduce_dims, keepdim=True).clamp_min(1e-6)
+    std_guidance = torch.std(guidance_result, dim=reduce_dims, keepdim=True).clamp_min(1e-6)
+    factor = std_cond / std_guidance
+    factor = rescale * factor + (1.0 - rescale)
+    return pag_guidance * factor
 
 
 def get_time_flag():
@@ -2247,6 +2361,20 @@ def build_generation_settings_dict(args) -> dict:
         "dit": args.dit,
         "vae": args.vae,
         "text_encoder": args.text_encoder,
+    }
+
+    # Always record the Anima-Safe PAG state (including enabled=False) so a reload knows PAG's settings
+    # even for a render made with PAG off; images from before PAG existed have no "pag" key at all.
+    settings["pag"] = {
+        "enabled": bool(getattr(args, "pag", False)),
+        "scale": getattr(args, "pag_scale", 4.0),
+        "block_indices": getattr(args, "pag_block_indices", "18"),
+        "perturbation_strength": getattr(args, "pag_perturbation_strength", 0.75),
+        "head_indices": getattr(args, "pag_head_indices", ""),
+        "start_percent": getattr(args, "pag_start_percent", 0.0),
+        "end_percent": getattr(args, "pag_end_percent", 0.7),
+        "rescale": getattr(args, "pag_rescale", 0.2),
+        "rescale_mode": getattr(args, "pag_rescale_mode", "full"),
     }
 
     recorded_lora_rows = build_recorded_lora_rows(args)

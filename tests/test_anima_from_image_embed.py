@@ -6,6 +6,7 @@ import torch
 from PIL import Image, PngImagePlugin
 
 from library import anima_er_sde_sampling
+from library.anima_models import apply_soft_pag_attention_perturbation
 
 from anima_minimal_inference import (
     SAMPLER_OPTION_CHOICES,
@@ -34,6 +35,9 @@ from anima_minimal_inference import (
     read_png_parsed_metadata,
     read_png_prompt_overrides,
     resolve_random_seed,
+    parse_pag_index_spec,
+    pag_is_active_for_sigma,
+    rescale_pag_guidance,
     hold_exclusive_cross_process_file_lock,
     serialize_model_file_disk_reads,
     serialize_model_loading_phase,
@@ -894,6 +898,43 @@ def test_generation_settings_dict_has_core_fields_with_width_and_height_separate
     assert "test_lora" not in settings
 
 
+def test_generation_settings_dict_records_pag_defaults_disabled_when_args_lack_pag():
+    settings = build_generation_settings_dict(build_minimal_generation_args_namespace())
+    assert settings["pag"]["enabled"] is False
+    assert settings["pag"]["scale"] == 4.0
+    assert settings["pag"]["block_indices"] == "18"
+    assert settings["pag"]["perturbation_strength"] == 0.75
+    assert settings["pag"]["start_percent"] == 0.0
+    assert settings["pag"]["end_percent"] == 0.7
+    assert settings["pag"]["rescale"] == 0.2
+    assert settings["pag"]["rescale_mode"] == "full"
+
+
+def test_generation_settings_dict_records_enabled_pag_values():
+    args = build_minimal_generation_args_namespace()
+    args.pag = True
+    args.pag_scale = 3.0
+    args.pag_block_indices = "18-20"
+    args.pag_perturbation_strength = 0.5
+    args.pag_head_indices = "0,1"
+    args.pag_start_percent = 0.1
+    args.pag_end_percent = 0.6
+    args.pag_rescale = 0.3
+    args.pag_rescale_mode = "partial"
+    settings = build_generation_settings_dict(args)
+    assert settings["pag"] == {
+        "enabled": True,
+        "scale": 3.0,
+        "block_indices": "18-20",
+        "perturbation_strength": 0.5,
+        "head_indices": "0,1",
+        "start_percent": 0.1,
+        "end_percent": 0.6,
+        "rescale": 0.3,
+        "rescale_mode": "partial",
+    }
+
+
 def test_generation_settings_dict_includes_merged_loras_marked_enabled_when_no_record_json():
     args = build_minimal_generation_args_namespace()
     args.lora_weight = ["/loras/a.safetensors", "/loras/b.safetensors"]
@@ -1093,6 +1134,56 @@ def test_serialize_gpu_compute_all_scope_locks_every_phase(tmp_path):
         with serialize_gpu_compute(args, gpu_phase):
             assert _lock_path_is_currently_held_by_another_fd(lock_file_path), gpu_phase
         assert not _lock_path_is_currently_held_by_another_fd(lock_file_path), gpu_phase  # released after
+
+
+def test_parse_pag_index_spec():
+    assert parse_pag_index_spec("18") == [18]
+    assert parse_pag_index_spec("18,20,22") == [18, 20, 22]
+    assert parse_pag_index_spec("18-22") == [18, 19, 20, 21, 22]
+    assert parse_pag_index_spec("0,4-6") == [0, 4, 5, 6]
+    assert parse_pag_index_spec("22,18,18,20") == [18, 20, 22]  # deduped and sorted
+    assert parse_pag_index_spec("") == []
+    assert parse_pag_index_spec(None) == []
+
+
+def test_pag_is_active_for_sigma_respects_progress_window():
+    # Descending flow-sigma schedule of 10 steps: sigmas[0]=1.0 (start) ... sigmas[10]=0.0 (end).
+    sigmas = torch.linspace(1.0, 0.0, steps=11)
+    # start_percent=0.0, end_percent=0.7 -> active for the first ~70% of the schedule (high sigmas).
+    assert pag_is_active_for_sigma(sigmas[0], sigmas, 0.0, 0.7)  # very start: active
+    assert pag_is_active_for_sigma(sigmas[5], sigmas, 0.0, 0.7)  # mid, within window: active
+    assert not pag_is_active_for_sigma(sigmas[9], sigmas, 0.0, 0.7)  # near the end, past 0.7: inactive
+
+
+def test_rescale_pag_guidance_zero_rescale_returns_guidance_unchanged():
+    torch.manual_seed(0)
+    cond = torch.randn(2, 3, 4)
+    cfg = torch.randn(2, 3, 4)
+    guidance = torch.randn(2, 3, 4)
+    result_full = rescale_pag_guidance(guidance, cond, cfg, 0.0, "full")
+    assert torch.allclose(result_full, guidance, atol=1e-6)  # rescale=0 -> factor 1.0, unchanged
+    # rescale>0 generally changes the magnitude; just confirm it runs and keeps shape.
+    result_scaled = rescale_pag_guidance(guidance, cond, cfg, 0.5, "partial")
+    assert result_scaled.shape == guidance.shape
+
+
+def test_apply_soft_pag_attention_perturbation_blends_toward_value():
+    # attention_output is [..., n_heads*head_dim]; value is [..., n_heads, head_dim].
+    n_heads, head_dim = 2, 3
+    attention_output = torch.zeros(1, 4, n_heads * head_dim)
+    value = torch.ones(1, 4, n_heads, head_dim)
+
+    unchanged = apply_soft_pag_attention_perturbation(attention_output, value, 0.0, None, n_heads, head_dim)
+    assert torch.allclose(unchanged, attention_output)  # strength 0 -> normal attention
+
+    full = apply_soft_pag_attention_perturbation(attention_output, value, 1.0, None, n_heads, head_dim)
+    assert torch.allclose(full, torch.ones_like(attention_output))  # strength 1 -> pure value path
+
+    # Head filter: only head 0 blends fully; head 1 stays at the (zero) attention output.
+    one_head = apply_soft_pag_attention_perturbation(attention_output, value, 1.0, [0], n_heads, head_dim)
+    per_head = one_head.reshape(1, 4, n_heads, head_dim)
+    assert torch.allclose(per_head[:, :, 0, :], torch.ones(1, 4, head_dim))
+    assert torch.allclose(per_head[:, :, 1, :], torch.zeros(1, 4, head_dim))
 
 
 if __name__ == "__main__":

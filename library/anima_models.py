@@ -269,6 +269,35 @@ class GPT2FeedForward(nn.Module):
         return x
 
 
+def apply_soft_pag_attention_perturbation(
+    attention_output: torch.Tensor,
+    value: torch.Tensor,
+    perturbation_strength: float,
+    head_indices: Optional[list],
+    n_heads: int,
+    head_dim: int,
+) -> torch.Tensor:
+    """Blend a self-attention output toward the value/identity path for Anima-Safe PAG.
+
+    Faithful port of the ComfyUI node's `_soft_pag_attention` / `_lerp_heads`: linearly interpolate the
+    normal attention output toward the value tensor by perturbation_strength (0 = normal, 1 = pure value),
+    optionally only for selected attention heads. attention_output is [..., n_heads*head_dim]; value is
+    [..., n_heads, head_dim]. Applied BEFORE the output projection, matching the reference.
+    """
+    perturbation_strength = max(0.0, min(1.0, float(perturbation_strength)))
+    if perturbation_strength <= 0.0:
+        return attention_output
+    base_per_head = rearrange(attention_output, "... (h d) -> ... h d", h=n_heads, d=head_dim)
+    if head_indices is None:
+        blended_per_head = torch.lerp(base_per_head, value, perturbation_strength)
+    else:
+        blended_per_head = base_per_head.clone()
+        blended_per_head[..., head_indices, :] = torch.lerp(
+            base_per_head[..., head_indices, :], value[..., head_indices, :], perturbation_strength
+        )
+    return rearrange(blended_per_head, "... h d -> ... (h d)")
+
+
 # Attention module for DiT
 class Attention(nn.Module):
     """Multi-head attention supporting both self-attention and cross-attention.
@@ -312,6 +341,9 @@ class Attention(nn.Module):
         self._query_dim = query_dim
         self._context_dim = context_dim
         self._inner_dim = inner_dim
+        # Anima-Safe PAG: when set to (perturbation_strength, head_indices) this self-attention blends its
+        # output toward the value path for one perturbed forward pass; None = normal attention.
+        self.pag_perturbation: Optional[tuple] = None
         self.init_weights()
 
     def init_weights(self) -> None:
@@ -367,9 +399,15 @@ class Attention(nn.Module):
                 q = q.to(target_dtype)
                 k = k.to(target_dtype)
         # return self.compute_attention(q, k, v)
+        pag_value = v if self.pag_perturbation is not None else None  # keep v for the PAG blend below
         qkv = [q, k, v]
         del q, k, v
         result = attention.attention(qkv, attn_params=attn_params)
+        if self.pag_perturbation is not None:
+            perturbation_strength, head_indices = self.pag_perturbation
+            result = apply_soft_pag_attention_perturbation(
+                result, pag_value, perturbation_strength, head_indices, self.n_heads, self.head_dim
+            )
         return self.output_dropout(self.output_proj(result))
 
 
@@ -1160,6 +1198,19 @@ class Anima(nn.Module):
             block.init_weights()
         self.final_layer.init_weights()
         self.t_embedding_norm.reset_parameters()
+
+    def enable_soft_pag_perturbation(self, block_indices: list, perturbation_strength: float, head_indices: Optional[list]) -> None:
+        """Turn on Anima-Safe PAG self-attention perturbation for the given transformer block indices
+        (out-of-range indices are ignored). Call disable_soft_pag_perturbation() to restore normal
+        attention after the perturbed forward pass."""
+        for block_index in block_indices:
+            if 0 <= block_index < len(self.blocks):
+                self.blocks[block_index].self_attn.pag_perturbation = (perturbation_strength, head_indices)
+
+    def disable_soft_pag_perturbation(self) -> None:
+        """Restore normal self-attention on every block after a PAG-perturbed forward pass."""
+        for block in self.blocks:
+            block.self_attn.pag_perturbation = None
 
     def enable_gradient_checkpointing(self, cpu_offload: bool = False, unsloth_offload: bool = False):
         for block in self.blocks:
