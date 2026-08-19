@@ -1033,6 +1033,25 @@ def _make_gpu_lock_args(gpu_compute_lock_file, gpu_lock_scope):
     return argparse.Namespace(gpu_compute_lock_file=gpu_compute_lock_file, gpu_lock_scope=gpu_lock_scope)
 
 
+def test_batch_gpu_lock_held_across_nested_per_image_gpu_phase_locks(tmp_path):
+    # process_batch_prompts holds one outer GPU-denoise lock across the whole batch; each image's
+    # denoise/decode locks nest inside it. This proves the GPU lock is NOT released between images
+    # (a competing process cannot steal the GPU mid-batch), released only when the batch ends.
+    lock_file_path = str(tmp_path / "gpu_compute.lock")
+    args = _make_gpu_lock_args(lock_file_path, GPU_LOCK_SCOPE_DENOISE_ONLY)
+
+    assert not _lock_path_is_currently_held_by_another_fd(lock_file_path)
+    with serialize_gpu_compute(args, GPU_PHASE_DENOISE):  # outer batch-wide GPU lock
+        assert _lock_path_is_currently_held_by_another_fd(lock_file_path)
+        with serialize_gpu_compute(args, GPU_PHASE_DENOISE):  # image 1 denoise
+            assert _lock_path_is_currently_held_by_another_fd(lock_file_path)
+        assert _lock_path_is_currently_held_by_another_fd(lock_file_path)  # STILL held between images
+        with serialize_gpu_compute(args, GPU_PHASE_DENOISE):  # image 2 denoise
+            assert _lock_path_is_currently_held_by_another_fd(lock_file_path)
+        assert _lock_path_is_currently_held_by_another_fd(lock_file_path)  # STILL held
+    assert not _lock_path_is_currently_held_by_another_fd(lock_file_path)  # released only when batch ends
+
+
 def test_gpu_phase_is_covered_by_scope():
     # Denoise is always covered, regardless of scope.
     assert gpu_phase_is_covered_by_scope(GPU_PHASE_DENOISE, GPU_LOCK_SCOPE_DENOISE_ONLY)

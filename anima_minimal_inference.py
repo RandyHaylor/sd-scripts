@@ -1568,67 +1568,74 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
     all_precomputed_text_data = []
     conds_cache_batch = {}
 
-    logger.info("Preprocessing text and LLM/TextEncoder encoding for all prompts...")
-    temp_shared_models_txt = {
-        "text_encoder": text_encoder_batch,  # on GPU if not text_encoder_cpu
-        "conds_cache": conds_cache_batch,
-    }
+    # Hold the GPU lock across this batch's entire GPU work — the text-encode precompute loop AND every
+    # image's generate/decode — so once this process has the loaded models it keeps the GPU for all N
+    # images rather than releasing between them. Generation is a leapfrogging disk/GPU queue (never truly
+    # concurrent GPU use), so another process should not be able to steal the GPU mid-batch. This region
+    # does no model-file disk reads (models already loaded), so holding the GPU lock cannot deadlock
+    # against the disk-read lock. Re-entrant with the per-image denoise/decode locks nested inside.
+    with serialize_gpu_compute(args, GPU_PHASE_DENOISE):
+        logger.info("Preprocessing text and LLM/TextEncoder encoding for all prompts...")
+        temp_shared_models_txt = {
+            "text_encoder": text_encoder_batch,  # on GPU if not text_encoder_cpu
+            "conds_cache": conds_cache_batch,
+        }
 
-    for i, prompt_args_item in enumerate(all_prompt_args_list):
-        logger.info(f"Text preprocessing for prompt {i+1}/{len(all_prompt_args_list)}: {prompt_args_item.prompt}")
-
-        # prepare_text_inputs will move text_encoders to device temporarily
-        context, context_null = prepare_text_inputs(prompt_args_item, device, anima, temp_shared_models_txt)
-        text_data = {"context": context, "context_null": context_null}
-        all_precomputed_text_data.append(text_data)
-
-    # Models should be removed from device after prepare_text_inputs
-    del text_encoder_batch, temp_shared_models_txt, conds_cache_batch
-    gc.collect()  # Force cleanup of Text Encoder from GPU memory
-    clean_memory_on_device(device)
-
-    # Keep the DiT and VAE both resident so each prompt is generated, decoded, and saved before
-    # moving to the next prompt, rather than saving everything at the end. The settings .txt is
-    # written BEFORE generation (using a base name reused by the PNG) so you can read what is being
-    # generated while it renders. This is the inference path (no gradients), so both models fit; if it
-    # ever OOMs, decode can be moved back to a separate post-generation phase.
-    if args.output_type != "latent":
-        vae_for_batch.to(device)
-
-    os.makedirs(args.save_path, exist_ok=True)
-
-    logger.info("Generating and saving each prompt's output before moving to the next...")
-    with torch.no_grad():
         for i, prompt_args_item in enumerate(all_prompt_args_list):
-            current_text_data = all_precomputed_text_data[i]
-            height, width = check_inputs(prompt_args_item)  # Get height/width for each prompt
+            logger.info(f"Text preprocessing for prompt {i+1}/{len(all_prompt_args_list)}: {prompt_args_item.prompt}")
 
-            # Reserve the base name and write the settings sidecar before generation starts.
-            image_base_name = f"{get_time_flag()}_{prompt_args_item.seed}"
-            if prompt_args_item.output_type != "latent":
-                write_generation_settings_sidecar(args.save_path, image_base_name, prompt_args_item)
+            # prepare_text_inputs will move text_encoders to device temporarily
+            context, context_null = prepare_text_inputs(prompt_args_item, device, anima, temp_shared_models_txt)
+            text_data = {"context": context, "context_null": context_null}
+            all_precomputed_text_data.append(text_data)
 
-            logger.info(f"Generating {i+1}/{len(all_prompt_args_list)}: {prompt_args_item.prompt}")
-            try:
-                # generate uses precomputed text data and the resident DiT (shared_models_for_generate).
-                latent = generate(prompt_args_item, gen_settings, shared_models_for_generate, current_text_data)
+        # Models should be removed from device after prepare_text_inputs
+        del text_encoder_batch, temp_shared_models_txt, conds_cache_batch
+        gc.collect()  # Force cleanup of Text Encoder from GPU memory
+        clean_memory_on_device(device)
 
-                if latent is None:
-                    continue
+        # Keep the DiT and VAE both resident so each prompt is generated, decoded, and saved before
+        # moving to the next prompt, rather than saving everything at the end. The settings .txt is
+        # written BEFORE generation (using a base name reused by the PNG) so you can read what is being
+        # generated while it renders. This is the inference path (no gradients), so both models fit; if it
+        # ever OOMs, decode can be moved back to a separate post-generation phase.
+        if args.output_type != "latent":
+            vae_for_batch.to(device)
 
-                if prompt_args_item.output_type in ["latent", "latent_images"]:
-                    save_latent(latent, prompt_args_item, height, width)
+        os.makedirs(args.save_path, exist_ok=True)
 
+        logger.info("Generating and saving each prompt's output before moving to the next...")
+        with torch.no_grad():
+            for i, prompt_args_item in enumerate(all_prompt_args_list):
+                current_text_data = all_precomputed_text_data[i]
+                height, width = check_inputs(prompt_args_item)  # Get height/width for each prompt
+
+                # Reserve the base name and write the settings sidecar before generation starts.
+                image_base_name = f"{get_time_flag()}_{prompt_args_item.seed}"
                 if prompt_args_item.output_type != "latent":
-                    # latent_images already saved the latent above; decode + save the image now.
-                    if prompt_args_item.output_type == "latent_images":
-                        prompt_args_item.output_type = "images"
-                    save_output(prompt_args_item, vae_for_batch, latent, device, precomputed_image_name=image_base_name)
+                    write_generation_settings_sidecar(args.save_path, image_base_name, prompt_args_item)
 
-                del latent
-            except Exception as e:
-                logger.error(f"Error generating/saving prompt: {prompt_args_item.prompt}. Error: {e}", exc_info=True)
-                continue
+                logger.info(f"Generating {i+1}/{len(all_prompt_args_list)}: {prompt_args_item.prompt}")
+                try:
+                    # generate uses precomputed text data and the resident DiT (shared_models_for_generate).
+                    latent = generate(prompt_args_item, gen_settings, shared_models_for_generate, current_text_data)
+
+                    if latent is None:
+                        continue
+
+                    if prompt_args_item.output_type in ["latent", "latent_images"]:
+                        save_latent(latent, prompt_args_item, height, width)
+
+                    if prompt_args_item.output_type != "latent":
+                        # latent_images already saved the latent above; decode + save the image now.
+                        if prompt_args_item.output_type == "latent_images":
+                            prompt_args_item.output_type = "images"
+                        save_output(prompt_args_item, vae_for_batch, latent, device, precomputed_image_name=image_base_name)
+
+                    del latent
+                except Exception as e:
+                    logger.error(f"Error generating/saving prompt: {prompt_args_item.prompt}. Error: {e}", exc_info=True)
+                    continue
 
     # Free DiT and VAE
     logger.info("Releasing DiT and VAE from memory...")
