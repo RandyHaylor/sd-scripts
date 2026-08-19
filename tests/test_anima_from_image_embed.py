@@ -34,6 +34,16 @@ from anima_minimal_inference import (
     read_png_parsed_metadata,
     read_png_prompt_overrides,
     resolve_random_seed,
+    hold_exclusive_cross_process_file_lock,
+    serialize_model_file_disk_reads,
+    serialize_model_loading_phase,
+    serialize_gpu_compute,
+    gpu_phase_is_covered_by_scope,
+    GPU_LOCK_SCOPE_DENOISE_ONLY,
+    GPU_LOCK_SCOPE_ALL_COMPUTE,
+    GPU_PHASE_TEXT_ENCODE,
+    GPU_PHASE_DENOISE,
+    GPU_PHASE_VAE_DECODE,
     stream_usable_prompt_overrides,
 )
 
@@ -929,6 +939,141 @@ def test_generation_settings_dict_records_source_image_and_test_lora_when_set():
     settings = build_generation_settings_dict(args)
     assert settings["source_image"] == "/refs/reference.png"
     assert settings["test_lora"] == "/loras/test.safetensors 1.0"
+
+
+def _lock_path_is_currently_held_by_another_fd(lock_file_path):
+    """True if an exclusive non-blocking flock on lock_file_path fails because it is already held.
+
+    Uses a separate open file description, so within one process it still contends with a lock held via
+    serialize_model_file_disk_reads (flock locks are per open-file-description on Linux)."""
+    import fcntl
+
+    with open(lock_file_path, "w") as probe_file:
+        try:
+            fcntl.flock(probe_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(probe_file.fileno(), fcntl.LOCK_UN)
+            return False
+        except BlockingIOError:
+            return True
+
+
+def test_serialize_model_file_disk_reads_is_noop_when_path_is_falsy(tmp_path):
+    body_ran = []
+    with serialize_model_file_disk_reads(None):
+        body_ran.append(True)
+    with serialize_model_file_disk_reads(""):
+        body_ran.append(True)
+    assert body_ran == [True, True]
+
+
+def test_serialize_model_file_disk_reads_holds_and_releases_exclusive_lock(tmp_path):
+    lock_file_path = str(tmp_path / "model_load_disk.lock")
+
+    assert not _lock_path_is_currently_held_by_another_fd(lock_file_path)  # free before
+
+    with serialize_model_file_disk_reads(lock_file_path):
+        assert _lock_path_is_currently_held_by_another_fd(lock_file_path)  # held during
+
+    assert not _lock_path_is_currently_held_by_another_fd(lock_file_path)  # released after
+
+
+def test_serialize_model_file_disk_reads_releases_even_when_body_raises(tmp_path):
+    lock_file_path = str(tmp_path / "model_load_disk.lock")
+
+    class DiskReadFailure(Exception):
+        pass
+
+    try:
+        with serialize_model_file_disk_reads(lock_file_path):
+            raise DiskReadFailure()
+    except DiskReadFailure:
+        pass
+
+    assert not _lock_path_is_currently_held_by_another_fd(lock_file_path)  # released despite the raise
+
+
+def test_hold_lock_is_reentrant_within_thread_without_deadlocking(tmp_path):
+    lock_file_path = str(tmp_path / "reentrant.lock")
+    # Nesting the same path must NOT self-deadlock (a naive second flock on a new fd of the same file
+    # would block forever), and the lock must stay held across both levels.
+    with hold_exclusive_cross_process_file_lock(lock_file_path):
+        assert _lock_path_is_currently_held_by_another_fd(lock_file_path)
+        with hold_exclusive_cross_process_file_lock(lock_file_path):
+            assert _lock_path_is_currently_held_by_another_fd(lock_file_path)  # still held (inner)
+        assert _lock_path_is_currently_held_by_another_fd(lock_file_path)  # still held after inner exits
+    assert not _lock_path_is_currently_held_by_another_fd(lock_file_path)  # released after outermost
+
+
+def test_loading_phase_holds_the_disk_lock_across_nested_per_file_reads(tmp_path):
+    lock_file_path = str(tmp_path / "model_load_disk.lock")
+    args = argparse.Namespace(model_load_disk_lock_file=lock_file_path)
+
+    assert not _lock_path_is_currently_held_by_another_fd(lock_file_path)
+    with serialize_model_loading_phase(args):
+        # Simulate the per-file load locks nested inside the phase: the lock stays held continuously
+        # (never released between files), so a competing process cannot slip in and requeue this one.
+        with serialize_model_file_disk_reads(lock_file_path):
+            assert _lock_path_is_currently_held_by_another_fd(lock_file_path)
+        assert _lock_path_is_currently_held_by_another_fd(lock_file_path)  # STILL held between files
+        with serialize_model_file_disk_reads(lock_file_path):
+            assert _lock_path_is_currently_held_by_another_fd(lock_file_path)
+        assert _lock_path_is_currently_held_by_another_fd(lock_file_path)  # STILL held between files
+    assert not _lock_path_is_currently_held_by_another_fd(lock_file_path)  # released when phase ends
+
+
+def test_loading_phase_is_noop_when_no_lock_file(tmp_path):
+    args = argparse.Namespace(model_load_disk_lock_file=None)
+    ran = []
+    with serialize_model_loading_phase(args):
+        ran.append(True)
+    assert ran == [True]
+
+
+def _make_gpu_lock_args(gpu_compute_lock_file, gpu_lock_scope):
+    return argparse.Namespace(gpu_compute_lock_file=gpu_compute_lock_file, gpu_lock_scope=gpu_lock_scope)
+
+
+def test_gpu_phase_is_covered_by_scope():
+    # Denoise is always covered, regardless of scope.
+    assert gpu_phase_is_covered_by_scope(GPU_PHASE_DENOISE, GPU_LOCK_SCOPE_DENOISE_ONLY)
+    assert gpu_phase_is_covered_by_scope(GPU_PHASE_DENOISE, GPU_LOCK_SCOPE_ALL_COMPUTE)
+    # Text-encode and VAE-decode are covered only under the strict 'all compute' scope.
+    assert not gpu_phase_is_covered_by_scope(GPU_PHASE_TEXT_ENCODE, GPU_LOCK_SCOPE_DENOISE_ONLY)
+    assert not gpu_phase_is_covered_by_scope(GPU_PHASE_VAE_DECODE, GPU_LOCK_SCOPE_DENOISE_ONLY)
+    assert gpu_phase_is_covered_by_scope(GPU_PHASE_TEXT_ENCODE, GPU_LOCK_SCOPE_ALL_COMPUTE)
+    assert gpu_phase_is_covered_by_scope(GPU_PHASE_VAE_DECODE, GPU_LOCK_SCOPE_ALL_COMPUTE)
+
+
+def test_serialize_gpu_compute_is_noop_when_no_lock_file(tmp_path):
+    args = _make_gpu_lock_args(None, GPU_LOCK_SCOPE_ALL_COMPUTE)
+    ran = []
+    with serialize_gpu_compute(args, GPU_PHASE_DENOISE):
+        ran.append(True)
+    assert ran == [True]
+
+
+def test_serialize_gpu_compute_denoise_only_scope_locks_denoise_not_encode_or_decode(tmp_path):
+    lock_file_path = str(tmp_path / "gpu_compute.lock")
+    args = _make_gpu_lock_args(lock_file_path, GPU_LOCK_SCOPE_DENOISE_ONLY)
+
+    with serialize_gpu_compute(args, GPU_PHASE_DENOISE):
+        assert _lock_path_is_currently_held_by_another_fd(lock_file_path)  # denoise IS locked
+
+    with serialize_gpu_compute(args, GPU_PHASE_TEXT_ENCODE):
+        assert not _lock_path_is_currently_held_by_another_fd(lock_file_path)  # encode is NOT locked
+
+    with serialize_gpu_compute(args, GPU_PHASE_VAE_DECODE):
+        assert not _lock_path_is_currently_held_by_another_fd(lock_file_path)  # decode is NOT locked
+
+
+def test_serialize_gpu_compute_all_scope_locks_every_phase(tmp_path):
+    lock_file_path = str(tmp_path / "gpu_compute.lock")
+    args = _make_gpu_lock_args(lock_file_path, GPU_LOCK_SCOPE_ALL_COMPUTE)
+
+    for gpu_phase in (GPU_PHASE_TEXT_ENCODE, GPU_PHASE_DENOISE, GPU_PHASE_VAE_DECODE):
+        with serialize_gpu_compute(args, gpu_phase):
+            assert _lock_path_is_currently_held_by_another_fd(lock_file_path), gpu_phase
+        assert not _lock_path_is_currently_held_by_another_fd(lock_file_path), gpu_phase  # released after
 
 
 if __name__ == "__main__":

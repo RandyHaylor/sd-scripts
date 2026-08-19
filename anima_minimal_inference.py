@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import datetime
 import gc
 from importlib.util import find_spec
@@ -6,8 +7,14 @@ import json
 import random
 import os
 import re
+import threading
 import time
 import copy
+
+try:
+    import fcntl  # POSIX-only; used to serialize model-file disk reads across processes
+except ImportError:
+    fcntl = None  # non-POSIX (e.g. Windows): disk-read serialization becomes a no-op
 from types import SimpleNamespace
 from typing import Tuple, Optional, List, Any, Dict, Union
 
@@ -274,6 +281,34 @@ def parse_args() -> argparse.Namespace:
         "--prompt_count 4, then again with --prompt_count_skip_first 4 --prompt_count 4 for the next 4.",
     )
     parser.add_argument("--interactive", action="store_true", help="Interactive mode: read prompts from console")
+    parser.add_argument(
+        "--model_load_disk_lock_file",
+        type=str,
+        default=None,
+        help="Path to a lock file used to serialize model-file disk reads ACROSS processes: while this "
+        "process reads the DiT/text-encoder/VAE/LoRA weights from disk it holds an exclusive lock on "
+        "this file, so other inference processes sharing the same path wait until it finishes loading. "
+        "Denoising runs outside the lock, so concurrent runs naturally stagger disk-load vs GPU work. "
+        "Omit (default) to disable locking entirely.",
+    )
+    parser.add_argument(
+        "--gpu_compute_lock_file",
+        type=str,
+        default=None,
+        help="Path to a lock file used to serialize GPU compute ACROSS processes: while this process runs "
+        "GPU work it holds an exclusive lock on this file, so other inference processes sharing the same "
+        "path wait for the GPU. Combined with --model_load_disk_lock_file this makes concurrent runs a "
+        "pipeline (one loads from disk while another uses the GPU). Omit (default) to disable.",
+    )
+    parser.add_argument(
+        "--gpu_lock_scope",
+        type=str,
+        default=GPU_LOCK_SCOPE_DENOISE_ONLY,
+        choices=GPU_LOCK_SCOPE_CHOICES,
+        help=f"Which GPU work --gpu_compute_lock_file guards. '{GPU_LOCK_SCOPE_DENOISE_ONLY}' (default) locks "
+        f"only the denoise loop (the heavy, sustained GPU cost). '{GPU_LOCK_SCOPE_ALL_COMPUTE}' also locks "
+        "text-encode and VAE-decode, so exactly one process touches the GPU at any instant.",
+    )
 
     args = parser.parse_args()
 
@@ -745,6 +780,102 @@ def select_dit_lora_state_dict(lora_sd: Dict[str, Any]) -> Dict[str, Any]:
     return convert_peft_diffusion_model_lora_keys(lora_sd)
 
 
+GPU_LOCK_SCOPE_DENOISE_ONLY = "denoise"  # lock only the denoise loop (the heavy, sustained GPU work)
+GPU_LOCK_SCOPE_ALL_COMPUTE = "all"  # also lock text-encode and VAE-decode: one process on the GPU at any instant
+GPU_LOCK_SCOPE_CHOICES = (GPU_LOCK_SCOPE_DENOISE_ONLY, GPU_LOCK_SCOPE_ALL_COMPUTE)
+
+# GPU compute phases, used to decide which spans the GPU lock covers for a given scope.
+GPU_PHASE_TEXT_ENCODE = "text_encode"
+GPU_PHASE_DENOISE = "denoise"
+GPU_PHASE_VAE_DECODE = "vae_decode"
+
+
+_thread_local_held_file_locks = threading.local()
+
+
+@contextlib.contextmanager
+def hold_exclusive_cross_process_file_lock(lock_file_path: Optional[str]):
+    """Hold an exclusive cross-process lock on lock_file_path for the duration of the with-block, so only
+    one inference process at a time runs the guarded work (others block until it releases).
+
+    Re-entrant per path within a thread: nesting another with-block on the SAME path keeps the single
+    lock held (the outermost block releases it). This lets a coarse 'loading phase' lock wrap the
+    fine-grained per-file locks without self-deadlocking (flock on a second fd of the same file would
+    otherwise block against the first, even within one process).
+
+    A no-op (yields immediately, no lock) when lock_file_path is falsy or fcntl is unavailable (non-POSIX),
+    preserving the original unlocked behavior when the feature is not requested."""
+    if not lock_file_path or fcntl is None:
+        yield
+        return
+
+    held_lock_depth_by_path = getattr(_thread_local_held_file_locks, "depth_by_path", None)
+    if held_lock_depth_by_path is None:
+        held_lock_depth_by_path = {}
+        _thread_local_held_file_locks.depth_by_path = held_lock_depth_by_path
+
+    if held_lock_depth_by_path.get(lock_file_path, 0) > 0:
+        # This thread already holds the lock for this path: reuse it (re-entrant), do not re-acquire.
+        held_lock_depth_by_path[lock_file_path] += 1
+        try:
+            yield
+        finally:
+            held_lock_depth_by_path[lock_file_path] -= 1
+        return
+
+    with open(lock_file_path, "w") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        held_lock_depth_by_path[lock_file_path] = 1
+        try:
+            yield
+        finally:
+            held_lock_depth_by_path[lock_file_path] = 0
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def serialize_model_file_disk_reads(lock_file_path: Optional[str]):
+    """Serialize a single model-file disk read across processes: while held, only one inference process
+    reads that file from disk at a time. See hold_exclusive_cross_process_file_lock."""
+    return hold_exclusive_cross_process_file_lock(lock_file_path)
+
+
+def serialize_model_loading_phase(args: argparse.Namespace):
+    """Hold the model-file disk-read lock across an entire model-loading phase (all the files a process
+    loads back-to-back), so it is not released between individual files. This prevents lock thrashing
+    where another process grabs the lock mid-load and requeues this one. Re-entrant with the per-file
+    serialize_model_file_disk_reads locks nested inside the load calls (same path). Released before any
+    GPU work so concurrent runs still pipeline disk-load against GPU compute."""
+    return hold_exclusive_cross_process_file_lock(getattr(args, "model_load_disk_lock_file", None))
+
+
+def gpu_phase_is_covered_by_scope(gpu_phase: str, gpu_lock_scope: str) -> bool:
+    """Whether a GPU compute phase is serialized under the given scope. The denoise loop is always
+    covered; text-encode and VAE-decode are covered only under the 'all compute' (strict) scope."""
+    if gpu_phase == GPU_PHASE_DENOISE:
+        return True
+    return gpu_lock_scope == GPU_LOCK_SCOPE_ALL_COMPUTE
+
+
+def serialize_gpu_compute(args: argparse.Namespace, gpu_phase: str):
+    """Serialize a GPU compute phase across processes so only one process runs it at a time (others wait).
+
+    Returns a context manager that holds args.gpu_compute_lock_file while active, but only when that lock
+    file is set AND the phase is covered by args.gpu_lock_scope (see gpu_phase_is_covered_by_scope);
+    otherwise it is a no-op. Every guarded span is disk-read free, so it never blocks while holding the
+    GPU lock and thus cannot deadlock against the disk-read lock."""
+    gpu_lock_file_path = getattr(args, "gpu_compute_lock_file", None)
+    gpu_lock_scope = getattr(args, "gpu_lock_scope", GPU_LOCK_SCOPE_DENOISE_ONLY)
+    should_lock = bool(gpu_lock_file_path) and gpu_phase_is_covered_by_scope(gpu_phase, gpu_lock_scope)
+    return hold_exclusive_cross_process_file_lock(gpu_lock_file_path if should_lock else None)
+
+
+def load_qwen_image_vae_serialized(args: argparse.Namespace, **load_kwargs):
+    """Load the Qwen-Image VAE, holding the cross-process disk-read lock while its weights are read from
+    disk (see serialize_model_file_disk_reads). Thin wrapper so every VAE load site shares the lock."""
+    with serialize_model_file_disk_reads(getattr(args, "model_load_disk_lock_file", None)):
+        return anima_train_utils.load_qwen_image_vae(args, **load_kwargs)
+
+
 def load_dit_model(
     args: argparse.Namespace, device: torch.device, dit_weight_dtype: Optional[torch.dtype] = None
 ) -> anima_models.Anima:
@@ -764,33 +895,35 @@ def load_dit_model(
     if not args.lycoris:
         loading_device = device
 
-    # load LoRA weights
-    if not args.lycoris and args.lora_weight is not None and len(args.lora_weight) > 0:
-        lora_weights_list = []
-        for lora_weight in args.lora_weight:
-            logger.info(f"Loading LoRA weight from: {lora_weight}")
-            lora_sd = load_file(lora_weight)  # load on CPU, dtype is as is
-            # Keep kohya 'lora_unet_' keys, or auto-convert ComfyUI/PEFT 'diffusion_model.' LoRAs.
-            lora_sd = select_dit_lora_state_dict(lora_sd)
-            lora_weights_list.append(lora_sd)
-    else:
-        lora_weights_list = None
-
     loading_weight_dtype = dit_weight_dtype
     if args.fp8_scaled and not args.lycoris:
         loading_weight_dtype = None  # we will load weights as-is and then optimize to fp8
 
-    model = anima_utils.load_anima_model(
-        device,
-        args.dit,
-        args.attn_mode,
-        True,  # enable split_attn to trim masked tokens
-        loading_device,
-        loading_weight_dtype,
-        args.fp8_scaled and not args.lycoris,
-        lora_weights_list=lora_weights_list,
-        lora_multipliers=args.lora_multiplier,
-    )
+    # Read the DiT weights (and any DiT LoRA files) from disk under the cross-process disk-read lock, so
+    # concurrent inference processes do not read model files from disk at the same time.
+    with serialize_model_file_disk_reads(getattr(args, "model_load_disk_lock_file", None)):
+        if not args.lycoris and args.lora_weight is not None and len(args.lora_weight) > 0:
+            lora_weights_list = []
+            for lora_weight in args.lora_weight:
+                logger.info(f"Loading LoRA weight from: {lora_weight}")
+                lora_sd = load_file(lora_weight)  # load on CPU, dtype is as is
+                # Keep kohya 'lora_unet_' keys, or auto-convert ComfyUI/PEFT 'diffusion_model.' LoRAs.
+                lora_sd = select_dit_lora_state_dict(lora_sd)
+                lora_weights_list.append(lora_sd)
+        else:
+            lora_weights_list = None
+
+        model = anima_utils.load_anima_model(
+            device,
+            args.dit,
+            args.attn_mode,
+            True,  # enable split_attn to trim masked tokens
+            loading_device,
+            loading_weight_dtype,
+            args.fp8_scaled and not args.lycoris,
+            lora_weights_list=lora_weights_list,
+            lora_multipliers=args.lora_multiplier,
+        )
     if not args.fp8_scaled:
         # simple cast to dit_weight_dtype
         target_dtype = None  # load as-is (dit_weight_dtype == dtype of the weights in state_dict)
@@ -815,21 +948,24 @@ def load_dit_model(
 def load_text_encoder(
     args: argparse.Namespace, dtype: torch.dtype = torch.bfloat16, device: torch.device = torch.device("cpu")
 ) -> torch.nn.Module:
-    lora_weights_list = None
-    if args.lora_weight is not None and len(args.lora_weight) > 0:
-        lora_weights_list = []
-        for lora_weight in args.lora_weight:
-            logger.info(f"Loading LoRA weight from: {lora_weight}")
-            lora_sd = load_file(lora_weight)  # load on CPU, dtype is as is
-            # lora_sd = filter_lora_state_dict(lora_sd, args.include_patterns, args.exclude_patterns)
-            lora_sd = {
-                "model_" + k[len("lora_te_") :]: v for k, v in lora_sd.items() if k.startswith("lora_te_")
-            }  # only keep Text Encoder lora weights, remove prefix "lora_te_" and add "model_" prefix
-            lora_weights_list.append(lora_sd)
+    # Read the text-encoder weights (and any TE LoRA files) from disk under the cross-process disk-read
+    # lock, so concurrent inference processes do not read model files from disk at the same time.
+    with serialize_model_file_disk_reads(getattr(args, "model_load_disk_lock_file", None)):
+        lora_weights_list = None
+        if args.lora_weight is not None and len(args.lora_weight) > 0:
+            lora_weights_list = []
+            for lora_weight in args.lora_weight:
+                logger.info(f"Loading LoRA weight from: {lora_weight}")
+                lora_sd = load_file(lora_weight)  # load on CPU, dtype is as is
+                # lora_sd = filter_lora_state_dict(lora_sd, args.include_patterns, args.exclude_patterns)
+                lora_sd = {
+                    "model_" + k[len("lora_te_") :]: v for k, v in lora_sd.items() if k.startswith("lora_te_")
+                }  # only keep Text Encoder lora weights, remove prefix "lora_te_" and add "model_" prefix
+                lora_weights_list.append(lora_sd)
 
-    text_encoder, _ = anima_utils.load_qwen3_text_encoder(
-        args.text_encoder, dtype=dtype, device=device, lora_weights=lora_weights_list, lora_multipliers=args.lora_multiplier
-    )
+        text_encoder, _ = anima_utils.load_qwen3_text_encoder(
+            args.text_encoder, dtype=dtype, device=device, lora_weights=lora_weights_list, lora_multipliers=args.lora_multiplier
+        )
     text_encoder.eval()
     return text_encoder
 
@@ -924,7 +1060,7 @@ def prepare_text_inputs(
         tokenize_strategy = strategy_base.TokenizeStrategy.get_strategy()
         encoding_strategy = strategy_base.TextEncodingStrategy.get_strategy()
 
-        with torch.no_grad():
+        with serialize_gpu_compute(args, GPU_PHASE_TEXT_ENCODE), torch.no_grad():
             # embed = anima_text_encoder.get_text_embeds(anima, tokenizer, text_encoder, t5xxl_tokenizer, prompt)
             tokens = tokenize_strategy.tokenize(prompt)
             embed = encoding_strategy.encode_tokens(tokenize_strategy, [text_encoder], tokens)
@@ -950,7 +1086,7 @@ def prepare_text_inputs(
         tokenize_strategy = strategy_base.TokenizeStrategy.get_strategy()
         encoding_strategy = strategy_base.TextEncodingStrategy.get_strategy()
 
-        with torch.no_grad():
+        with serialize_gpu_compute(args, GPU_PHASE_TEXT_ENCODE), torch.no_grad():
             # negative_embed = anima_text_encoder.get_text_embeds(anima, tokenizer, text_encoder, t5xxl_tokenizer, negative_prompt)
             tokens = tokenize_strategy.tokenize(negative_prompt)
             negative_embed = encoding_strategy.encode_tokens(tokenize_strategy, [text_encoder], tokens)
@@ -1101,20 +1237,23 @@ def generate_body(
         velocity = run_velocity_with_cfg(current_latents, sigma_scalar).to(torch.float32)
         return current_latents.to(torch.float32) - sigma_scalar.to(torch.float32) * velocity
 
-    if args.sampler == "er_sde":
-        latents = anima_er_sde_sampling.sample_er_sde_rectified_flow(
-            predict_denoised_x0, latents, sigmas, seed=args.seed
-        ).to(latents.dtype)
-    elif args.sampler == "euler_ancestral":
-        latents = anima_er_sde_sampling.sample_euler_ancestral_rectified_flow(
-            predict_denoised_x0, latents, sigmas, seed=args.seed
-        ).to(latents.dtype)
-    else:
-        with tqdm(total=len(sigmas) - 1, desc="Denoising steps") as pbar:
-            for i in range(len(sigmas) - 1):
-                noise_pred = run_velocity_with_cfg(latents, sigmas[i])
-                latents = hunyuan_image_utils.step(latents, noise_pred, sigmas, i).to(latents.dtype)
-                pbar.update()
+    # The denoise loop is the heavy, sustained GPU work; serialize it across processes (no disk reads
+    # happen here, so holding the GPU lock cannot deadlock against the disk-read lock).
+    with serialize_gpu_compute(args, GPU_PHASE_DENOISE):
+        if args.sampler == "er_sde":
+            latents = anima_er_sde_sampling.sample_er_sde_rectified_flow(
+                predict_denoised_x0, latents, sigmas, seed=args.seed
+            ).to(latents.dtype)
+        elif args.sampler == "euler_ancestral":
+            latents = anima_er_sde_sampling.sample_euler_ancestral_rectified_flow(
+                predict_denoised_x0, latents, sigmas, seed=args.seed
+            ).to(latents.dtype)
+        else:
+            with tqdm(total=len(sigmas) - 1, desc="Denoising steps") as pbar:
+                for i in range(len(sigmas) - 1):
+                    noise_pred = run_velocity_with_cfg(latents, sigmas[i])
+                    latents = hunyuan_image_utils.step(latents, noise_pred, sigmas, i).to(latents.dtype)
+                    pbar.update()
 
     return latents
 
@@ -1294,7 +1433,9 @@ def save_output(
             width // 8,  # qwen_image_autoencoder_kl.SCALE_FACTOR,
         )
 
-    image = decode_latent(vae, latent, device)
+    # VAE decode is GPU compute (no disk reads); serialize it too under the strict GPU-lock scope.
+    with serialize_gpu_compute(args, GPU_PHASE_VAE_DECODE):
+        image = decode_latent(vae, latent, device)
 
     if args.output_type == "images" or args.output_type == "latent_images":
         # save images
@@ -1392,34 +1533,37 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
     dit_weight_dtype = gen_settings.dit_weight_dtype
     device = gen_settings.device
 
-    # 1. Prepare VAE
-    logger.info("Loading VAE for batch generation...")
-    vae_for_batch = anima_train_utils.load_qwen_image_vae(args, device="cpu", disable_mmap=True)
-    vae_for_batch.to(torch.bfloat16)
-    vae_for_batch.eval()
+    # Load all model files (VAE, DiT, text encoder) back-to-back under one held disk-read lock, so the
+    # lock is not released between files (no thrashing). Released before the GPU text-encode loop below.
+    with serialize_model_loading_phase(args):
+        # 1. Prepare VAE
+        logger.info("Loading VAE for batch generation...")
+        vae_for_batch = load_qwen_image_vae_serialized(args, device="cpu", disable_mmap=True)
+        vae_for_batch.to(torch.bfloat16)
+        vae_for_batch.eval()
 
-    all_prompt_args_list = [apply_overrides(args, pd) for pd in prompts_data]  # Create all arg instances first
-    for prompt_args in all_prompt_args_list:
-        check_inputs(prompt_args)  # Validate each prompt's height/width
+        all_prompt_args_list = [apply_overrides(args, pd) for pd in prompts_data]  # Create all arg instances first
+        for prompt_args in all_prompt_args_list:
+            check_inputs(prompt_args)  # Validate each prompt's height/width
 
-    # 2. Load DiT Model once
-    logger.info("Loading DiT model for batch generation...")
-    # Use args from the first prompt for DiT loading (LoRA etc. should be consistent for a batch)
-    first_prompt_args = all_prompt_args_list[0]
-    anima = load_dit_model(first_prompt_args, device, dit_weight_dtype)  # Load directly to target device if possible
+        # 2. Load DiT Model once
+        logger.info("Loading DiT model for batch generation...")
+        # Use args from the first prompt for DiT loading (LoRA etc. should be consistent for a batch)
+        first_prompt_args = all_prompt_args_list[0]
+        anima = load_dit_model(first_prompt_args, device, dit_weight_dtype)  # Load directly to target device if possible
 
-    shared_models_for_generate = {"model": anima}  # Pass DiT via shared_models
+        shared_models_for_generate = {"model": anima}  # Pass DiT via shared_models
 
-    # 3. Precompute Text Data (Text Encoder)
-    logger.info("Loading Text Encoder for batch text preprocessing...")
+        # 3. Precompute Text Data (Text Encoder)
+        logger.info("Loading Text Encoder for batch text preprocessing...")
 
-    # Text Encoder loaded to CPU by load_text_encoder
-    text_encoder_dtype = torch.bfloat16  # Default dtype for Text Encoder
-    text_encoder_batch = load_text_encoder(args, dtype=text_encoder_dtype, device=torch.device("cpu"))
+        # Text Encoder loaded to CPU by load_text_encoder
+        text_encoder_dtype = torch.bfloat16  # Default dtype for Text Encoder
+        text_encoder_batch = load_text_encoder(args, dtype=text_encoder_dtype, device=torch.device("cpu"))
 
-    # Text Encoder to device for this phase
-    text_encoder_device = torch.device("cpu") if args.text_encoder_cpu else device
-    text_encoder_batch.to(text_encoder_device)  # Moved into prepare_text_inputs logic
+        # Text Encoder to device for this phase
+        text_encoder_device = torch.device("cpu") if args.text_encoder_cpu else device
+        text_encoder_batch.to(text_encoder_device)  # Moved into prepare_text_inputs logic
 
     all_precomputed_text_data = []
     conds_cache_batch = {}
@@ -1505,12 +1649,14 @@ def process_interactive(args: argparse.Namespace) -> None:
     """
     gen_settings = get_generation_settings(args)
     device = gen_settings.device
-    shared_models = load_shared_models(args)
-    shared_models["conds_cache"] = {}  # Initialize empty cache for interactive mode
-
-    vae = anima_train_utils.load_qwen_image_vae(args, device="cpu", disable_mmap=True)
-    vae.to(torch.bfloat16)
-    vae.eval()
+    # Load the text encoder and VAE back-to-back under one held disk-read lock (no thrashing between
+    # files). The DiT is loaded lazily by generate() under its own held lock on first use.
+    with serialize_model_loading_phase(args):
+        shared_models = load_shared_models(args)
+        shared_models["conds_cache"] = {}  # Initialize empty cache for interactive mode
+        vae = load_qwen_image_vae_serialized(args, device="cpu", disable_mmap=True)
+        vae.to(torch.bfloat16)
+        vae.eval()
 
     print("Interactive mode. Enter prompts (Ctrl+D or Ctrl+Z (Windows) to exit):")
 
@@ -1576,12 +1722,14 @@ def process_folder_streaming(args: argparse.Namespace) -> None:
     device = gen_settings.device
 
     # Text encoder in shared_models; the DiT is loaded lazily by generate() and cached here for reuse.
-    shared_models = load_shared_models(args)
-    shared_models["conds_cache"] = {}
-
-    vae = anima_train_utils.load_qwen_image_vae(args, device="cpu", disable_mmap=True)
-    vae.to(torch.bfloat16)
-    vae.eval()
+    # Load the text encoder and VAE back-to-back under one held disk-read lock (no thrashing between
+    # files). The DiT is loaded lazily by generate() under its own held lock on first use.
+    with serialize_model_loading_phase(args):
+        shared_models = load_shared_models(args)
+        shared_models["conds_cache"] = {}
+        vae = load_qwen_image_vae_serialized(args, device="cpu", disable_mmap=True)
+        vae.to(torch.bfloat16)
+        vae.eval()
     if args.output_type != "latent":
         vae.to(device)
 
@@ -1675,12 +1823,14 @@ def process_image_embed_streaming(args: argparse.Namespace) -> None:
     device = gen_settings.device
 
     # Text encoder in shared_models; the DiT is loaded lazily by generate() and cached here for reuse.
-    shared_models = load_shared_models(args)
-    shared_models["conds_cache"] = {}
-
-    vae = anima_train_utils.load_qwen_image_vae(args, device="cpu", disable_mmap=True)
-    vae.to(torch.bfloat16)
-    vae.eval()
+    # Load the text encoder and VAE back-to-back under one held disk-read lock (no thrashing between
+    # files). The DiT is loaded lazily by generate() under its own held lock on first use.
+    with serialize_model_loading_phase(args):
+        shared_models = load_shared_models(args)
+        shared_models["conds_cache"] = {}
+        vae = load_qwen_image_vae_serialized(args, device="cpu", disable_mmap=True)
+        vae.to(torch.bfloat16)
+        vae.eval()
     if args.output_type != "latent":
         vae.to(device)
 
@@ -2250,7 +2400,7 @@ def main():
 
             latents_list.append(latents)
 
-        vae = anima_train_utils.load_qwen_image_vae(args, device=device, disable_mmap=True)
+        vae = load_qwen_image_vae_serialized(args, device=device, disable_mmap=True)
         vae.to(torch.bfloat16)
         vae.eval()
 
