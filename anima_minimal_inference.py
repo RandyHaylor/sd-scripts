@@ -148,6 +148,18 @@ def parse_args() -> argparse.Namespace:
         "main prompt (the LoRA's trigger words). Total images = (#test LoRAs) x (images otherwise). The "
         "settings sidecar records the source image path and the test LoRA.",
     )
+    parser.add_argument(
+        "--dit_test_folder",
+        type=str,
+        default=None,
+        metavar="FOLDER",
+        help="DiT A/B tester: run the entire otherwise-configured generation once PER top-level .safetensors "
+        "DiT in FOLDER (subfolders ignored), reloading models for each. Each test DiT may be an all-in-one "
+        "checkpoint (its baked-in VAE/text encoder are extracted and used). --dit is optional here; when "
+        "provided it is added to the sweep list too, deduped if identical (by real path) to a folder entry. "
+        "If --lora_test_folder is also set, every test DiT is swept against every test LoRA (nested). The "
+        "settings sidecar records the test DiT path.",
+    )
 
     # inference
     parser.add_argument(
@@ -356,6 +368,12 @@ def parse_args() -> argparse.Namespace:
 
     if args.lora_test_folder and args.latent_path:
         raise ValueError("--lora_test_folder cannot be combined with --latent_path (latent decode does not use LoRAs)")
+
+    if args.dit_test_folder and args.interactive:
+        raise ValueError("--dit_test_folder cannot be combined with --interactive")
+
+    if args.dit_test_folder and args.latent_path:
+        raise ValueError("--dit_test_folder cannot be combined with --latent_path (latent decode uses only the VAE)")
 
     if args.lycoris and not lycoris_available:
         raise ValueError("install lycoris: https://github.com/KohakuBlueleaf/LyCORIS")
@@ -2126,13 +2144,26 @@ COMBINED_CHECKPOINT_COMPONENTS = [
     },
 ]
 
-COMBINED_CHECKPOINT_DETECT_PREFIXES = ("model.diffusion_model.", "first_stage_model.", "cond_stage_model.")
+DIT_COMBINED_CHECKPOINT_SOURCE_PREFIX = "model.diffusion_model."
 
 
 def detect_combined_checkpoint(keys) -> bool:
-    """True when the given safetensors keys include all three combined-checkpoint component prefixes."""
+    """True when the checkpoint stores its DiT under the combined 'model.diffusion_model.' namespace (an
+    all-in-one civitai/ComfyUI checkpoint). The VAE and text encoder may or may not also be baked in;
+    whichever are present are extracted, and any absent component falls back to --vae / --text_encoder."""
     key_list = list(keys)
-    return all(any(key.startswith(prefix) for key in key_list) for prefix in COMBINED_CHECKPOINT_DETECT_PREFIXES)
+    return any(key.startswith(DIT_COMBINED_CHECKPOINT_SOURCE_PREFIX) for key in key_list)
+
+
+def select_present_combined_components(all_keys) -> List[dict]:
+    """Return the subset of COMBINED_CHECKPOINT_COMPONENTS whose source prefix appears in all_keys, so a
+    partial checkpoint (e.g. DiT+VAE with no baked text encoder) extracts only what it actually contains."""
+    key_list = list(all_keys)
+    return [
+        component
+        for component in COMBINED_CHECKPOINT_COMPONENTS
+        if any(key.startswith(component["source_prefix"]) for key in key_list)
+    ]
 
 
 def derive_extracted_models_folder(dit_path: str) -> str:
@@ -2149,14 +2180,16 @@ def rename_combined_component_keys(all_keys, source_prefix: str, target_prefix: 
     return key_rename_map
 
 
-def extract_combined_checkpoint_to_folder(combined_checkpoint_path: str, output_folder: str) -> Dict[str, str]:
-    """Extract the bundled DiT/VAE/text-encoder from a combined checkpoint into split files in
-    output_folder (one component at a time to limit memory). Returns {component_name: file_path}."""
+def extract_combined_checkpoint_to_folder(
+    combined_checkpoint_path: str, output_folder: str, components: List[dict]
+) -> Dict[str, str]:
+    """Extract the given bundled components (DiT/VAE/text-encoder) from a combined checkpoint into split
+    files in output_folder (one component at a time to limit memory). Returns {component_name: file_path}."""
     os.makedirs(output_folder, exist_ok=True)
     extracted_paths = {}
     with safe_open(combined_checkpoint_path, framework="pt") as checkpoint:
         all_keys = list(checkpoint.keys())
-        for component in COMBINED_CHECKPOINT_COMPONENTS:
+        for component in components:
             key_rename_map = rename_combined_component_keys(
                 all_keys, component["source_prefix"], component["target_prefix"]
             )
@@ -2184,26 +2217,32 @@ def prepare_split_models_from_combined_checkpoint(args: argparse.Namespace) -> N
     if not detect_combined_checkpoint(checkpoint_keys):
         return
 
+    present_components = select_present_combined_components(checkpoint_keys)
     output_folder = derive_extracted_models_folder(args.dit)
     expected_paths = {
-        component["name"]: os.path.join(output_folder, component["filename"])
-        for component in COMBINED_CHECKPOINT_COMPONENTS
+        component["name"]: os.path.join(output_folder, component["filename"]) for component in present_components
     }
     if all(os.path.isfile(path) for path in expected_paths.values()):
         logger.info(f"Using previously extracted models from combined checkpoint in: {output_folder}")
         extracted_paths = expected_paths
     else:
-        logger.info(f"Combined checkpoint detected. Extracting embedded DiT/VAE/text encoder to: {output_folder}")
-        extracted_paths = extract_combined_checkpoint_to_folder(args.dit, output_folder)
+        component_names = ", ".join(component["name"] for component in present_components)
+        logger.info(f"Combined checkpoint detected. Extracting baked-in {component_names} to: {output_folder}")
+        extracted_paths = extract_combined_checkpoint_to_folder(args.dit, output_folder, present_components)
 
-    if (args.vae and args.vae != extracted_paths["vae"]) or (
-        args.text_encoder and args.text_encoder != extracted_paths["text_encoder"]
+    baked_in_vae_path = extracted_paths.get("vae")
+    baked_in_text_encoder_path = extracted_paths.get("text_encoder")
+    if (baked_in_vae_path and args.vae and args.vae != baked_in_vae_path) or (
+        baked_in_text_encoder_path and args.text_encoder and args.text_encoder != baked_in_text_encoder_path
     ):
         logger.info("Using the checkpoint's baked-in VAE/text encoder (overriding explicitly provided --vae/--text_encoder).")
 
+    # The DiT always comes from the checkpoint; the VAE/text encoder only when baked in (else keep --vae/--text_encoder).
     args.dit = extracted_paths["dit"]
-    args.vae = extracted_paths["vae"]
-    args.text_encoder = extracted_paths["text_encoder"]
+    if baked_in_vae_path:
+        args.vae = baked_in_vae_path
+    if baked_in_text_encoder_path:
+        args.text_encoder = baked_in_text_encoder_path
 
 
 def normalize_lora_test_folder_arg(args: argparse.Namespace) -> None:
@@ -2278,6 +2317,43 @@ def build_args_for_test_lora(base_args: argparse.Namespace, test_lora_path: str)
     test_args.pre_prompt = composed_pre_prompt  # used by from_folder / from_image_embed
     test_args.lora_test_prompt_prefix = composed_pre_prompt  # used by from_file / single --prompt
     test_args.current_test_lora = f"{test_lora_path} {base_args.lora_test_multiplier}"
+    return test_args
+
+
+def list_test_dit_paths(folder: str) -> List[str]:
+    """Return sorted full paths of top-level .safetensors DiT files in folder (subfolders ignored)."""
+    return sorted(
+        os.path.join(folder, name)
+        for name in os.listdir(folder)
+        if name.lower().endswith(".safetensors") and os.path.isfile(os.path.join(folder, name))
+    )
+
+
+def build_dit_test_sweep_paths(args: argparse.Namespace) -> List[str]:
+    """Return the ordered list of DiT paths to sweep: the sorted top-level .safetensors in
+    --dit_test_folder, followed by --dit (if provided) unless its real path already matches a folder
+    entry. Deduping is by os.path.realpath so an explicit --dit identical to a folder DiT is not run
+    twice."""
+    sweep_dit_paths = list_test_dit_paths(args.dit_test_folder)
+
+    explicit_dit_path = getattr(args, "dit", None)
+    if explicit_dit_path:
+        already_present_real_paths = {os.path.realpath(path) for path in sweep_dit_paths}
+        if os.path.realpath(explicit_dit_path) not in already_present_real_paths:
+            sweep_dit_paths.append(explicit_dit_path)
+
+    return sweep_dit_paths
+
+
+def build_args_for_test_dit(base_args: argparse.Namespace, test_dit_path: str) -> argparse.Namespace:
+    """Return a deep-copied args pointing --dit at test_dit_path, with the DiT-sweep flag cleared so the
+    sweep does not recurse and the test DiT recorded for the settings sidecar. VAE/text-encoder are left
+    for prepare_split_models_from_combined_checkpoint to resolve (each test DiT may be all-in-one).
+    base_args is not mutated."""
+    test_args = copy.deepcopy(base_args)
+    test_args.dit_test_folder = None  # prevent the sweep from recursing
+    test_args.dit = test_dit_path
+    test_args.current_test_dit = test_dit_path
     return test_args
 
 
@@ -2389,6 +2465,10 @@ def build_generation_settings_dict(args) -> dict:
     if test_lora:
         settings["test_lora"] = test_lora
 
+    test_dit = getattr(args, "current_test_dit", None)
+    if test_dit:
+        settings["test_dit"] = test_dit
+
     return settings
 
 
@@ -2451,6 +2531,44 @@ def dispatch_generation(args: argparse.Namespace) -> None:
         process_batch_prompts(prompts_data, args)
 
 
+def validate_text_encoder_and_vae_available(args: argparse.Namespace) -> None:
+    """Raise a clear error if no text encoder / VAE is available (neither passed explicitly nor supplied
+    by an all-in-one --dit checkpoint after prepare_split_models_from_combined_checkpoint)."""
+    if not args.text_encoder:
+        raise ValueError(
+            "No text encoder available: pass --text_encoder, or a --dit that is an all-in-one checkpoint "
+            "with the text encoder baked in."
+        )
+    if not args.vae:
+        raise ValueError(
+            "No VAE available: pass --vae, or a --dit that is an all-in-one checkpoint with the VAE baked in."
+        )
+
+
+def configure_tokenize_and_text_encoding_strategies(args: argparse.Namespace) -> None:
+    """Install the Anima tokenize/text-encoding strategies for args.text_encoder. Idempotent: the
+    process-global strategies can only be set once, and in a DiT sweep this is called per test DiT, so
+    each strategy is set only when still unset. The Qwen3 tokenizer for a .safetensors text encoder comes
+    from the bundled configs/qwen3_06b and is identical across test DiTs, so a single install is correct."""
+    if strategy_base.TokenizeStrategy.get_strategy() is None:
+        tokenize_strategy = strategy_anima.AnimaTokenizeStrategy(
+            qwen3_path=args.text_encoder, t5_tokenizer_path=None, qwen3_max_length=512, t5_max_length=512
+        )
+        strategy_base.TokenizeStrategy.set_strategy(tokenize_strategy)
+
+    if strategy_base.TextEncodingStrategy.get_strategy() is None:
+        encoding_strategy = strategy_anima.AnimaTextEncodingStrategy()
+        strategy_base.TextEncodingStrategy.set_strategy(encoding_strategy)
+
+
+def run_configured_generation_or_lora_sweep(args: argparse.Namespace) -> None:
+    """Run the whole configured generation once, or — when --lora_test_folder is set — once per test LoRA."""
+    if args.lora_test_folder:
+        run_lora_test_sweep(args)
+    else:
+        dispatch_generation(args)
+
+
 def run_lora_test_sweep(args: argparse.Namespace) -> None:
     """Run dispatch_generation once per top-level .safetensors in --lora_test_folder, each time with
     that test LoRA added on top of the fixed LoRAs. Models are reloaded for each test LoRA because
@@ -2470,24 +2588,39 @@ def run_lora_test_sweep(args: argparse.Namespace) -> None:
         dispatch_generation(test_args)
 
 
+def run_dit_test_sweep(args: argparse.Namespace) -> None:
+    """Run the whole configured generation once per DiT in the sweep list (top-level .safetensors in
+    --dit_test_folder plus --dit if given and distinct). Models reload for each test DiT; each test DiT
+    may be an all-in-one checkpoint whose baked-in VAE/text encoder are extracted and used. When
+    --lora_test_folder is also set, each test DiT is swept against every test LoRA (nested)."""
+    sweep_dit_paths = build_dit_test_sweep_paths(args)
+    if not sweep_dit_paths:
+        logger.warning(f"No .safetensors test DiTs found in {args.dit_test_folder} (and no --dit provided)")
+        return
+
+    logger.info(f"DiT test sweep: {len(sweep_dit_paths)} DiT(s) from {args.dit_test_folder} (plus --dit if distinct)")
+    for index, test_dit_path in enumerate(sweep_dit_paths):
+        logger.info(f"[test DiT {index + 1}/{len(sweep_dit_paths)}] {test_dit_path}")
+        test_args = build_args_for_test_dit(args, test_dit_path)
+        prepare_split_models_from_combined_checkpoint(test_args)
+        validate_text_encoder_and_vae_available(test_args)
+        configure_tokenize_and_text_encoding_strategies(test_args)
+        run_configured_generation_or_lora_sweep(test_args)
+
+
 def main():
     # Parse arguments
     args = parse_args()
     expand_lora_list_tokens_into_lora_args(args)
     normalize_lora_test_folder_arg(args)
 
-    # If --dit is an all-in-one checkpoint, extract/reuse its baked-in VAE + text encoder and repoint args.
-    prepare_split_models_from_combined_checkpoint(args)
-
-    if not args.text_encoder:
-        raise ValueError(
-            "No text encoder available: pass --text_encoder, or a --dit that is an all-in-one checkpoint "
-            "with the text encoder baked in."
-        )
-    if not args.vae:
-        raise ValueError(
-            "No VAE available: pass --vae, or a --dit that is an all-in-one checkpoint with the VAE baked in."
-        )
+    # In a DiT sweep each test DiT resolves its own combined-checkpoint extraction and VAE/text encoder,
+    # so defer that work into run_dit_test_sweep rather than resolving a single global --dit here.
+    running_dit_test_sweep = bool(args.dit_test_folder)
+    if not running_dit_test_sweep:
+        # If --dit is an all-in-one checkpoint, extract/reuse its baked-in VAE + text encoder and repoint args.
+        prepare_split_models_from_combined_checkpoint(args)
+        validate_text_encoder_and_vae_available(args)
 
     # Check if latents are provided
     latents_mode = args.latent_path is not None and len(args.latent_path) > 0
@@ -2543,20 +2676,13 @@ def main():
             args.seed = seeds[i]
             save_output(args, vae, latent, device, original_base_names[i])
 
+    elif running_dit_test_sweep:
+        # Each test DiT resolves its own VAE/text encoder and strategies inside the sweep.
+        run_dit_test_sweep(args)
+
     else:
-        tokenize_strategy = strategy_anima.AnimaTokenizeStrategy(
-            qwen3_path=args.text_encoder, t5_tokenizer_path=None, qwen3_max_length=512, t5_max_length=512
-        )
-        strategy_base.TokenizeStrategy.set_strategy(tokenize_strategy)
-
-        encoding_strategy = strategy_anima.AnimaTextEncodingStrategy()
-        strategy_base.TextEncodingStrategy.set_strategy(encoding_strategy)
-
-        if args.lora_test_folder:
-            # Run the whole configured generation once per test LoRA (models reload per test LoRA).
-            run_lora_test_sweep(args)
-        else:
-            dispatch_generation(args)
+        configure_tokenize_and_text_encoding_strategies(args)
+        run_configured_generation_or_lora_sweep(args)
 
     logger.info("Done!")
 

@@ -6,6 +6,7 @@ import torch
 from PIL import Image, PngImagePlugin
 
 from library import anima_er_sde_sampling
+from library import strategy_base
 from library.anima_models import apply_soft_pag_attention_perturbation
 
 from anima_minimal_inference import (
@@ -14,6 +15,10 @@ from anima_minimal_inference import (
     apply_image_embed_settings_gate,
     apply_pre_prompt_to_batch_prompts,
     build_args_for_test_lora,
+    build_args_for_test_dit,
+    build_dit_test_sweep_paths,
+    configure_tokenize_and_text_encoding_strategies,
+    list_test_dit_paths,
     build_generation_settings_dict,
     build_repeated_single_prompt_data,
     convert_peft_diffusion_model_lora_keys,
@@ -24,6 +29,8 @@ from anima_minimal_inference import (
     decode_exif_user_comment_bytes,
     derive_extracted_models_folder,
     detect_combined_checkpoint,
+    select_present_combined_components,
+    prepare_split_models_from_combined_checkpoint,
     list_test_lora_paths,
     rename_combined_component_keys,
     map_metadata_value_to_script_option,
@@ -690,6 +697,87 @@ def test_build_args_for_test_lora_appends_lora_and_injects(tmp_path):
     assert base_args.lora_weight == ["/fixed/a.safetensors"]
 
 
+def test_list_test_dit_paths_top_level_safetensors_sorted(tmp_path):
+    (tmp_path / "b_dit.safetensors").write_text("x")
+    (tmp_path / "a_dit.safetensors").write_text("x")
+    (tmp_path / "notes.txt").write_text("x")
+    (tmp_path / "ignored.ckpt").write_text("x")
+    subdir = tmp_path / "sub"
+    subdir.mkdir()
+    (subdir / "deep_dit.safetensors").write_text("x")
+
+    result = list_test_dit_paths(str(tmp_path))
+    assert result == [
+        os.path.join(str(tmp_path), "a_dit.safetensors"),
+        os.path.join(str(tmp_path), "b_dit.safetensors"),
+    ]
+
+
+def test_build_dit_test_sweep_paths_appends_explicit_dit_when_distinct(tmp_path):
+    folder_dit_path = os.path.join(str(tmp_path), "folder_dit.safetensors")
+    open(folder_dit_path, "w").close()
+    explicit_dit_path = os.path.join(str(tmp_path), "explicit_dit.safetensors")
+    open(explicit_dit_path, "w").close()
+
+    args = argparse.Namespace(dit_test_folder=str(tmp_path), dit=explicit_dit_path)
+    assert build_dit_test_sweep_paths(args) == [explicit_dit_path, folder_dit_path]
+
+
+def test_build_dit_test_sweep_paths_dedups_explicit_dit_identical_to_folder_entry(tmp_path):
+    folder_dit_path = os.path.join(str(tmp_path), "shared_dit.safetensors")
+    open(folder_dit_path, "w").close()
+
+    # Same file reached via a non-normalized path (trailing '.'): realpath dedup must collapse them.
+    aliased_same_dit_path = os.path.join(str(tmp_path), ".", "shared_dit.safetensors")
+    args = argparse.Namespace(dit_test_folder=str(tmp_path), dit=aliased_same_dit_path)
+    assert build_dit_test_sweep_paths(args) == [folder_dit_path]
+
+
+def test_build_dit_test_sweep_paths_folder_only_when_no_explicit_dit(tmp_path):
+    folder_dit_path = os.path.join(str(tmp_path), "only_dit.safetensors")
+    open(folder_dit_path, "w").close()
+
+    args = argparse.Namespace(dit_test_folder=str(tmp_path), dit=None)
+    assert build_dit_test_sweep_paths(args) == [folder_dit_path]
+
+
+def test_build_args_for_test_dit_points_dit_and_records_and_clears_folder():
+    base_args = argparse.Namespace(
+        dit="/models/explicit.safetensors",
+        dit_test_folder="/models/dit_folder",
+        vae=None,
+        text_encoder=None,
+    )
+    test_args = build_args_for_test_dit(base_args, "/models/dit_folder/candidate.safetensors")
+
+    assert test_args.dit == "/models/dit_folder/candidate.safetensors"
+    assert test_args.current_test_dit == "/models/dit_folder/candidate.safetensors"
+    # Sweep flag cleared so it does not recurse; base_args untouched.
+    assert test_args.dit_test_folder is None
+    assert base_args.dit == "/models/explicit.safetensors"
+    assert base_args.dit_test_folder == "/models/dit_folder"
+
+
+def test_configure_text_encoding_strategies_is_idempotent_across_test_dits():
+    # The DiT sweep calls this once per test DiT in a single process; the second call must not raise
+    # "strategy is already set". Uses a nonexistent .safetensors path so the tokenizer loads from the
+    # bundled configs/qwen3_06b (load_qwen3_tokenizer only reads the file path when it is a directory).
+    saved_tokenize_strategy = strategy_base.TokenizeStrategy.get_strategy()
+    saved_text_encoding_strategy = strategy_base.TextEncodingStrategy.get_strategy()
+    strategy_base.TokenizeStrategy._strategy = None
+    strategy_base.TextEncodingStrategy._strategy = None
+    try:
+        args = argparse.Namespace(text_encoder="/nonexistent/text_encoder.safetensors")
+        configure_tokenize_and_text_encoding_strategies(args)
+        first_tokenize_strategy = strategy_base.TokenizeStrategy.get_strategy()
+        configure_tokenize_and_text_encoding_strategies(args)  # must not raise on the second test DiT
+        assert strategy_base.TokenizeStrategy.get_strategy() is first_tokenize_strategy
+        assert strategy_base.TextEncodingStrategy.get_strategy() is not None
+    finally:
+        strategy_base.TokenizeStrategy._strategy = saved_tokenize_strategy
+        strategy_base.TextEncodingStrategy._strategy = saved_text_encoding_strategy
+
+
 def _args_for_png_metadata():
     return argparse.Namespace(
         prompt="a cat, masterpiece",
@@ -755,6 +843,54 @@ def test_detect_combined_checkpoint_true_when_all_three_prefixes_present():
 def test_detect_combined_checkpoint_false_for_split_dit_only():
     keys = ["net.blocks.0.weight", "net.blocks.1.weight"]
     assert detect_combined_checkpoint(keys) is False
+
+
+def test_detect_combined_checkpoint_true_for_dit_and_vae_without_text_encoder():
+    # Partial all-in-one (civitai mixes bundling a VAE but not the text encoder). The DiT lives in the
+    # combined 'model.diffusion_model.' namespace, so it still needs extraction.
+    keys = [
+        "model.diffusion_model.x_embedder.weight",
+        "first_stage_model.decoder.conv1.weight",
+    ]
+    assert detect_combined_checkpoint(keys) is True
+
+
+def test_select_present_combined_components_dit_and_vae_only():
+    keys = [
+        "model.diffusion_model.x_embedder.weight",
+        "first_stage_model.decoder.conv1.weight",
+    ]
+    present_names = [component["name"] for component in select_present_combined_components(keys)]
+    assert present_names == ["dit", "vae"]
+
+
+def test_prepare_split_models_extracts_present_components_and_keeps_user_text_encoder(tmp_path):
+    import safetensors.torch
+
+    combined_path = os.path.join(str(tmp_path), "pearlyMix_v1.safetensors")
+    safetensors.torch.save_file(
+        {
+            "model.diffusion_model.x_embedder.weight": torch.zeros(2, 2),
+            "first_stage_model.conv1.weight": torch.zeros(2, 2),
+        },
+        combined_path,
+    )
+
+    args = argparse.Namespace(
+        dit=combined_path,
+        vae=None,
+        text_encoder="/user/provided/text_encoder.safetensors",
+    )
+    prepare_split_models_from_combined_checkpoint(args)
+
+    extracted_folder = os.path.splitext(combined_path)[0]
+    assert args.dit == os.path.join(extracted_folder, "dit.safetensors")
+    assert args.vae == os.path.join(extracted_folder, "vae.safetensors")
+    assert os.path.isfile(args.dit)
+    assert os.path.isfile(args.vae)
+    # No baked text encoder: the user-provided path is preserved and no empty file is written.
+    assert args.text_encoder == "/user/provided/text_encoder.safetensors"
+    assert not os.path.isfile(os.path.join(extracted_folder, "text_encoder.safetensors"))
 
 
 def test_derive_extracted_models_folder_strips_extension():
@@ -980,6 +1116,13 @@ def test_generation_settings_dict_records_source_image_and_test_lora_when_set():
     settings = build_generation_settings_dict(args)
     assert settings["source_image"] == "/refs/reference.png"
     assert settings["test_lora"] == "/loras/test.safetensors 1.0"
+
+
+def test_generation_settings_dict_records_test_dit_when_set():
+    args = build_minimal_generation_args_namespace()
+    args.current_test_dit = "/models/dit_folder/candidate.safetensors"
+    settings = build_generation_settings_dict(args)
+    assert settings["test_dit"] == "/models/dit_folder/candidate.safetensors"
 
 
 def _lock_path_is_currently_held_by_another_fd(lock_file_path):
