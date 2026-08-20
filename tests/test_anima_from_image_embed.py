@@ -30,6 +30,7 @@ from anima_minimal_inference import (
     derive_extracted_models_folder,
     detect_combined_checkpoint,
     select_present_combined_components,
+    combined_checkpoint_baked_vae_is_qwen_compatible,
     prepare_split_models_from_combined_checkpoint,
     list_test_lora_paths,
     rename_combined_component_keys,
@@ -45,6 +46,7 @@ from anima_minimal_inference import (
     parse_pag_index_spec,
     pag_is_active_for_sigma,
     rescale_pag_guidance,
+    get_flow_pag_scalar,
     hold_exclusive_cross_process_file_lock,
     serialize_model_file_disk_reads,
     serialize_model_loading_phase,
@@ -405,6 +407,108 @@ def test_build_simple_sigmas_varies_with_flow_shift():
     a = anima_er_sde_sampling.build_simple_sigmas(20, 1.0, torch.device("cpu"))
     b = anima_er_sde_sampling.build_simple_sigmas(20, 5.0, torch.device("cpu"))
     assert not torch.equal(a, b)
+
+
+def test_build_diffusers_flowmatch_sigmas_descends_to_zero():
+    sigmas = anima_er_sde_sampling.build_diffusers_flowmatch_sigmas(10, 1.0, torch.device("cpu"))
+    assert len(sigmas) == 11  # steps + 1 (trailing 0)
+    assert float(sigmas[-1]) == 0.0
+    values = [float(s) for s in sigmas]
+    assert all(values[i] > values[i + 1] for i in range(len(values) - 1)), values
+    # at flow_shift 1.0 the shift is the identity, so sigmas are linspace(1.0, 1/1000, steps) + [0.0].
+    assert values[0] == 1.0
+    assert abs(values[-2] - 1.0 / 1000) < 1e-6
+
+
+def test_build_diffusers_flowmatch_sigmas_matches_static_shift_reference():
+    # Hand-computed diffusers static-shift schedule for 4 steps, flow_shift 3.0.
+    flow_shift = 3.0
+    num_train_timesteps = 1000
+    unshifted = torch.linspace(1.0, 1.0 / num_train_timesteps, 4, dtype=torch.float32)
+    expected_nonzero = flow_shift * unshifted / (1.0 + (flow_shift - 1.0) * unshifted)
+    expected = torch.cat([expected_nonzero, torch.zeros(1, dtype=torch.float32)])
+
+    sigmas = anima_er_sde_sampling.build_diffusers_flowmatch_sigmas(4, flow_shift, torch.device("cpu"))
+    assert torch.allclose(sigmas, expected, atol=1e-6), (sigmas, expected)
+
+
+def test_build_diffusers_flowmatch_sigmas_varies_with_flow_shift():
+    a = anima_er_sde_sampling.build_diffusers_flowmatch_sigmas(20, 1.0, torch.device("cpu"))
+    b = anima_er_sde_sampling.build_diffusers_flowmatch_sigmas(20, 3.0, torch.device("cpu"))
+    assert not torch.equal(a, b)
+
+
+def test_compute_qwen_image_dynamic_shift_mu_matches_diffusers_calculate_shift():
+    # 1024x1024 -> latent 128x128 -> packed seq (128//2)*(128//2) = 64*64 = 4096.
+    mu = anima_er_sde_sampling.compute_qwen_image_dynamic_shift_mu(4096)
+    # base_shift 0.5 + (0.9-0.5)*(4096-256)/(8192-256) = 0.5 + 0.4*3840/7936 = 0.693548...
+    assert abs(mu - 0.6935483870967742) < 1e-9
+    import math
+    # effective static-equivalent shift = exp(mu) ~ 2.0 at 1024x1024 (NOT 3.0).
+    assert abs(math.exp(mu) - 2.0007) < 1e-3
+
+
+def test_build_diffusers_dynamic_flowmatch_sigmas_descends_to_zero():
+    sigmas = anima_er_sde_sampling.build_diffusers_dynamic_flowmatch_sigmas(10, 4096, torch.device("cpu"))
+    assert len(sigmas) == 11  # steps + 1 (trailing 0)
+    assert float(sigmas[-1]) == 0.0
+    values = [float(s) for s in sigmas]
+    assert all(values[i] > values[i + 1] for i in range(len(values) - 1)), values
+    assert values[0] == 1.0
+
+
+def test_build_diffusers_dynamic_flowmatch_sigmas_equals_static_at_exp_mu():
+    # The dynamic (exponential time_shift) schedule equals the static linear-shift schedule at
+    # flow_shift = exp(mu) -- the algebraic identity that makes both faithful to diffusers.
+    import math
+    image_seq_len = 6889  # 1328x1328 -> latent 166x166 -> packed 83*83
+    mu = anima_er_sde_sampling.compute_qwen_image_dynamic_shift_mu(image_seq_len)
+    dynamic = anima_er_sde_sampling.build_diffusers_dynamic_flowmatch_sigmas(24, image_seq_len, torch.device("cpu"))
+    static_equiv = anima_er_sde_sampling.build_diffusers_flowmatch_sigmas(24, math.exp(mu), torch.device("cpu"))
+    assert torch.allclose(dynamic, static_equiv, atol=1e-6), (dynamic, static_equiv)
+
+
+def test_build_diffusers_dynamic_flowmatch_sigmas_varies_with_resolution():
+    low = anima_er_sde_sampling.build_diffusers_dynamic_flowmatch_sigmas(20, 1024, torch.device("cpu"))
+    high = anima_er_sde_sampling.build_diffusers_dynamic_flowmatch_sigmas(20, 6889, torch.device("cpu"))
+    assert not torch.equal(low, high)
+
+
+def test_compute_qwen_image_dynamic_shift_mu_respects_custom_base_and_max_shift():
+    # At the base seq length (256) mu == base_shift; at the max (8192) mu == max_shift, for any endpoints.
+    assert abs(anima_er_sde_sampling.compute_qwen_image_dynamic_shift_mu(256, base_shift=0.3, max_shift=1.2) - 0.3) < 1e-9
+    assert abs(anima_er_sde_sampling.compute_qwen_image_dynamic_shift_mu(8192, base_shift=0.3, max_shift=1.2) - 1.2) < 1e-9
+
+
+def test_build_diffusers_dynamic_flowmatch_sigmas_varies_with_shift_endpoints():
+    default_shift = anima_er_sde_sampling.build_diffusers_dynamic_flowmatch_sigmas(20, 4096, torch.device("cpu"))
+    custom_shift = anima_er_sde_sampling.build_diffusers_dynamic_flowmatch_sigmas(
+        20, 4096, torch.device("cpu"), base_shift=0.2, max_shift=1.3
+    )
+    assert not torch.equal(default_shift, custom_shift)
+
+
+def test_get_flow_pag_scalar_linear_is_normalized_sigma():
+    sigmas = torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0], dtype=torch.float32)
+    # curve_exponent 1.0 -> scalar == sigma / sigmas[0]; sigmas[0] is 1.0 here so scalar == sigma.
+    assert abs(get_flow_pag_scalar(sigmas[0], sigmas, 1.0) - 1.0) < 1e-6
+    assert abs(get_flow_pag_scalar(sigmas[2], sigmas, 1.0) - 0.5) < 1e-6
+    assert abs(get_flow_pag_scalar(sigmas[4], sigmas, 1.0) - 0.0) < 1e-6
+
+
+def test_get_flow_pag_scalar_curve_exponent_shapes_curve():
+    sigmas = torch.tensor([2.0, 1.0, 0.0], dtype=torch.float32)  # sigmas[0]=2.0 -> normalized halves it
+    # at current_sigma 1.0, normalized = 0.5. exponent 2 -> 0.25; exponent 0.5 -> ~0.707.
+    assert abs(get_flow_pag_scalar(torch.tensor(1.0), sigmas, 2.0) - 0.25) < 1e-6
+    assert abs(get_flow_pag_scalar(torch.tensor(1.0), sigmas, 0.5) - (0.5 ** 0.5)) < 1e-6
+
+
+def test_get_flow_pag_scalar_clamps_and_handles_zero_max():
+    sigmas = torch.tensor([1.0, 0.5, 0.0], dtype=torch.float32)
+    # current_sigma above max clamps to 1.0
+    assert get_flow_pag_scalar(torch.tensor(5.0), sigmas, 1.0) == 1.0
+    # degenerate zero-max schedule returns 0.0 rather than dividing by zero
+    assert get_flow_pag_scalar(torch.tensor(0.0), torch.tensor([0.0, 0.0]), 1.0) == 0.0
 
 
 def test_euler_ancestral_identity_denoiser_no_eta_returns_input():
@@ -864,6 +968,32 @@ def test_select_present_combined_components_dit_and_vae_only():
     assert present_names == ["dit", "vae"]
 
 
+def test_baked_vae_qwen_compatible_true_for_qwen_namespace():
+    keys = [
+        "model.diffusion_model.x_embedder.weight",
+        "first_stage_model.encoder.down_blocks.0.norm1.gamma",
+        "first_stage_model.decoder.up_blocks.0.resnets.0.conv1.weight",
+        "first_stage_model.encoder.mid_block.attentions.0.norm.gamma",
+    ]
+    assert combined_checkpoint_baked_vae_is_qwen_compatible(keys) is True
+
+
+def test_baked_vae_qwen_compatible_false_for_stable_diffusion_vae():
+    # SD AutoencoderKL namespace (encoder.down.N.block / mid.attn_1) is NOT a Qwen VAE.
+    keys = [
+        "model.diffusion_model.x_embedder.weight",
+        "first_stage_model.encoder.down.0.block.0.conv1.weight",
+        "first_stage_model.encoder.mid.attn_1.q.weight",
+        "first_stage_model.decoder.up.3.block.2.conv2.weight",
+    ]
+    assert combined_checkpoint_baked_vae_is_qwen_compatible(keys) is False
+
+
+def test_baked_vae_qwen_compatible_false_when_no_baked_vae():
+    keys = ["model.diffusion_model.x_embedder.weight", "cond_stage_model.qwen3_06b.transformer.x.weight"]
+    assert combined_checkpoint_baked_vae_is_qwen_compatible(keys) is False
+
+
 def test_prepare_split_models_extracts_present_components_and_keeps_user_text_encoder(tmp_path):
     import safetensors.torch
 
@@ -871,7 +1001,7 @@ def test_prepare_split_models_extracts_present_components_and_keeps_user_text_en
     safetensors.torch.save_file(
         {
             "model.diffusion_model.x_embedder.weight": torch.zeros(2, 2),
-            "first_stage_model.conv1.weight": torch.zeros(2, 2),
+            "first_stage_model.encoder.down_blocks.0.conv1.weight": torch.zeros(2, 2),
         },
         combined_path,
     )
@@ -891,6 +1021,34 @@ def test_prepare_split_models_extracts_present_components_and_keeps_user_text_en
     # No baked text encoder: the user-provided path is preserved and no empty file is written.
     assert args.text_encoder == "/user/provided/text_encoder.safetensors"
     assert not os.path.isfile(os.path.join(extracted_folder, "text_encoder.safetensors"))
+
+
+def test_prepare_split_models_ignores_foreign_baked_vae_and_keeps_user_vae(tmp_path):
+    import safetensors.torch
+
+    combined_path = os.path.join(str(tmp_path), "pearlyOpalToonMix_v2.safetensors")
+    safetensors.torch.save_file(
+        {
+            "model.diffusion_model.x_embedder.weight": torch.zeros(2, 2),
+            # Stable-Diffusion AutoencoderKL namespace (NOT a Qwen VAE): must be ignored.
+            "first_stage_model.encoder.down.0.block.0.conv1.weight": torch.zeros(2, 2),
+            "first_stage_model.encoder.mid.attn_1.q.weight": torch.zeros(2, 2),
+        },
+        combined_path,
+    )
+
+    args = argparse.Namespace(
+        dit=combined_path,
+        vae="/user/provided/qwen_image_vae.safetensors",
+        text_encoder=None,
+    )
+    prepare_split_models_from_combined_checkpoint(args)
+
+    extracted_folder = os.path.splitext(combined_path)[0]
+    assert args.dit == os.path.join(extracted_folder, "dit.safetensors")
+    # The foreign baked VAE is ignored; the user-provided --vae is preserved and no vae file is written.
+    assert args.vae == "/user/provided/qwen_image_vae.safetensors"
+    assert not os.path.isfile(os.path.join(extracted_folder, "vae.safetensors"))
 
 
 def test_derive_extracted_models_folder_strips_extension():
@@ -1044,6 +1202,9 @@ def test_generation_settings_dict_records_pag_defaults_disabled_when_args_lack_p
     assert settings["pag"]["end_percent"] == 0.7
     assert settings["pag"]["rescale"] == 0.2
     assert settings["pag"]["rescale_mode"] == "full"
+    assert settings["pag"]["flow_matched_enabled"] is False
+    assert settings["pag"]["flow_matched_strength"] == 1.0
+    assert settings["pag"]["flow_matched_curve_exponent"] == 1.0
 
 
 def test_generation_settings_dict_records_enabled_pag_values():
@@ -1057,6 +1218,9 @@ def test_generation_settings_dict_records_enabled_pag_values():
     args.pag_end_percent = 0.6
     args.pag_rescale = 0.3
     args.pag_rescale_mode = "partial"
+    args.flow_matched_pag = True
+    args.flow_matched_pag_strength = 0.5
+    args.flow_matched_pag_curve_exponent = 2.0
     settings = build_generation_settings_dict(args)
     assert settings["pag"] == {
         "enabled": True,
@@ -1068,6 +1232,9 @@ def test_generation_settings_dict_records_enabled_pag_values():
         "end_percent": 0.6,
         "rescale": 0.3,
         "rescale_mode": "partial",
+        "flow_matched_enabled": True,
+        "flow_matched_strength": 0.5,
+        "flow_matched_curve_exponent": 2.0,
     }
 
 

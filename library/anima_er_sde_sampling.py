@@ -5,6 +5,8 @@ Faithful ports of:
   with the flow/CONST log-SNR branch hardcoded (er_lambda = sigma / (1 - sigma)).
 - ComfyUI comfy/samplers.py :: beta_scheduler, using RES4LYF's beta57 preset (alpha=0.5, beta=0.7),
   mapped onto the rectified-flow shifted sigma table.
+- huggingface/diffusers FlowMatchEulerDiscreteScheduler (static-shift schedule) as
+  build_diffusers_flowmatch_sigmas, the reference FlowMatch-Euler-style Anima schedule.
 
 Anima is a flow model: the DiT outputs a velocity v at (x_t, sigma), and the denoised x0 estimate is
 x0 = x_t - sigma * v  (ComfyUI CONST.calculate_denoised). ER-SDE consumes that x0 estimate.
@@ -78,6 +80,110 @@ def build_simple_sigmas(
     selected_sigmas = [float(sigma_table[-(1 + int(x * step_stride))]) for x in range(num_inference_steps)]
     selected_sigmas.append(0.0)
     return torch.tensor(selected_sigmas, dtype=torch.float32, device=device)
+
+
+def build_diffusers_flowmatch_sigmas(
+    num_inference_steps: int,
+    flow_shift: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Diffusers FlowMatchEulerDiscreteScheduler sigma schedule (static-shift path).
+
+    Faithful port of huggingface/diffusers scheduling_flow_match_euler_discrete.py set_timesteps
+    for the non-dynamic-shifting case, with num_train_timesteps=1000:
+        timesteps = linspace(sigma_max * 1000, sigma_min * 1000, num_inference_steps)
+                    with sigma_max = 1.0, sigma_min = 1 / 1000
+        sigmas    = timesteps / 1000                       -> linspace(1.0, 1/1000, steps)
+        sigmas    = flow_shift * sigmas / (1 + (flow_shift - 1) * sigmas)   # static linear shift
+        sigmas    = cat([sigmas, 0.0])                     # trailing 0 target for the final step
+
+    Stays in the flow sigma convention ([0, 1], descending toward 0) that Anima's DiT consumes
+    directly as its time input (matching training, where timesteps are scaled to [0, 1]).
+    """
+    num_train_timesteps = 1000
+    sigma_max = 1.0
+    sigma_min = 1.0 / num_train_timesteps
+
+    timesteps = torch.linspace(
+        sigma_max * num_train_timesteps,
+        sigma_min * num_train_timesteps,
+        num_inference_steps,
+        dtype=torch.float32,
+    )
+    sigmas = timesteps / num_train_timesteps
+    sigmas = flow_shift * sigmas / (1.0 + (flow_shift - 1.0) * sigmas)
+    sigmas = torch.cat([sigmas, torch.zeros(1, dtype=torch.float32)])
+    return sigmas.to(device=device)
+
+
+# Qwen-Image's own FlowMatchEulerDiscreteScheduler config (Qwen/Qwen-Image scheduler_config.json):
+# use_dynamic_shifting=true, base_shift=0.5, max_shift=0.9, base_image_seq_len=256,
+# max_image_seq_len=8192, time_shift_type="exponential". Anima is Qwen-Image-based, so these are the
+# faithful resolution-aware shift constants for it.
+QWEN_IMAGE_DYNAMIC_SHIFT_BASE_IMAGE_SEQ_LEN = 256
+QWEN_IMAGE_DYNAMIC_SHIFT_MAX_IMAGE_SEQ_LEN = 8192
+QWEN_IMAGE_DYNAMIC_SHIFT_BASE_SHIFT = 0.5
+QWEN_IMAGE_DYNAMIC_SHIFT_MAX_SHIFT = 0.9
+
+
+def compute_qwen_image_dynamic_shift_mu(
+    image_seq_len: int,
+    base_shift: float = QWEN_IMAGE_DYNAMIC_SHIFT_BASE_SHIFT,
+    max_shift: float = QWEN_IMAGE_DYNAMIC_SHIFT_MAX_SHIFT,
+) -> float:
+    """Diffusers calculate_shift for Qwen-Image: linear interpolation of mu by packed image token count.
+
+    mu = base_shift + (max_shift - base_shift) * (image_seq_len - base_seq) / (max_seq - base_seq)
+    with the Qwen-Image seq-len endpoints. base_shift/max_shift default to the Qwen-Image config values
+    but are exposed so they can be tuned. The effective time shift applied to sigmas is exp(mu)
+    (time_shift_type="exponential"), so this schedule equals build_diffusers_flowmatch_sigmas at
+    flow_shift = exp(mu).
+    """
+    base_seq = QWEN_IMAGE_DYNAMIC_SHIFT_BASE_IMAGE_SEQ_LEN
+    max_seq = QWEN_IMAGE_DYNAMIC_SHIFT_MAX_IMAGE_SEQ_LEN
+    slope = (max_shift - base_shift) / (max_seq - base_seq)
+    intercept = base_shift - slope * base_seq
+    return image_seq_len * slope + intercept
+
+
+def build_diffusers_dynamic_flowmatch_sigmas(
+    num_inference_steps: int,
+    image_seq_len: int,
+    device: torch.device,
+    base_shift: float = QWEN_IMAGE_DYNAMIC_SHIFT_BASE_SHIFT,
+    max_shift: float = QWEN_IMAGE_DYNAMIC_SHIFT_MAX_SHIFT,
+) -> torch.Tensor:
+    """Diffusers FlowMatchEulerDiscreteScheduler sigma schedule (dynamic-shifting path) for Qwen-Image.
+
+    Faithful port of set_timesteps with use_dynamic_shifting=true and time_shift_type="exponential",
+    num_train_timesteps=1000:
+        sigmas = linspace(1.0, 1/1000, num_inference_steps)
+        mu     = compute_qwen_image_dynamic_shift_mu(image_seq_len)
+        sigmas = exp(mu) / (exp(mu) + (1 / sigmas - 1))        # time_shift(mu, 1.0, sigmas)
+        sigmas = cat([sigmas, 0.0])
+
+    image_seq_len is the packed image token count the DiT processes. For Anima (VAE /8, patch_spatial 2,
+    image frame) that is (height // 16) * (width // 16). Resolution-aware: no fixed flow_shift; the shift
+    grows with resolution exactly as Qwen-Image samples.
+    """
+    import math
+
+    num_train_timesteps = 1000
+    sigma_max = 1.0
+    sigma_min = 1.0 / num_train_timesteps
+
+    timesteps = torch.linspace(
+        sigma_max * num_train_timesteps,
+        sigma_min * num_train_timesteps,
+        num_inference_steps,
+        dtype=torch.float32,
+    )
+    sigmas = timesteps / num_train_timesteps
+    mu = compute_qwen_image_dynamic_shift_mu(image_seq_len, base_shift, max_shift)
+    exp_mu = math.exp(mu)
+    sigmas = exp_mu / (exp_mu + (1.0 / sigmas - 1.0))
+    sigmas = torch.cat([sigmas, torch.zeros(1, dtype=torch.float32)])
+    return sigmas.to(device=device)
 
 
 @torch.no_grad()

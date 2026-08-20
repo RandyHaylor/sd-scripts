@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 # Valid choices for the --sampler / --scheduler options. Used both to define the argparse choices and
 # to decide whether a sampler/scheduler pulled from PNG metadata maps to something this script supports.
 SAMPLER_OPTION_CHOICES = ("euler", "er_sde", "euler_ancestral")
-SCHEDULER_OPTION_CHOICES = ("default", "beta57", "simple")
+SCHEDULER_OPTION_CHOICES = ("default", "beta57", "simple", "diffusers", "diffusers_dynamic")
 
 
 def map_metadata_value_to_script_option(raw_value: Optional[str], valid_options: Tuple[str, ...]) -> Optional[str]:
@@ -163,12 +163,12 @@ def parse_args() -> argparse.Namespace:
 
     # inference
     parser.add_argument(
-        "--guidance_scale", type=float, default=3.5, help="Guidance scale for classifier free guidance. Default is 3.5."
+        "--guidance_scale", type=float, default=4.5, help="Guidance scale for classifier free guidance. Default is 4.5 (Anima README recommends CFG 4-5)."
     )
     parser.add_argument("--prompt", type=str, default=None, help="prompt for generation")
     parser.add_argument("--negative_prompt", type=str, default="", help="negative prompt for generation, default is empty string")
     parser.add_argument("--image_size", type=int, nargs=2, default=[1024, 1024], help="image size, height and width")
-    parser.add_argument("--infer_steps", type=int, default=50, help="number of inference steps, default is 50")
+    parser.add_argument("--infer_steps", type=int, default=40, help="number of inference steps, default is 40")
     parser.add_argument("--save_path", type=str, required=True, help="path to save generated video")
     parser.add_argument(
         "--seed", type=int, default=None, help="Seed for evaluation. Omit or pass -1 for a random seed."
@@ -185,8 +185,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--flow_shift",
         type=float,
-        default=5.0,
-        help="Shift factor for flow matching schedulers. Default is 5.0.",
+        default=1.0,
+        help="Shift factor for flow matching schedulers (default 1.0, matching Anima's training "
+        "--discrete_flow_shift). Ignored by the diffusers_dynamic scheduler.",
+    )
+    parser.add_argument(
+        "--dynamic_base_shift",
+        type=float,
+        default=anima_er_sde_sampling.QWEN_IMAGE_DYNAMIC_SHIFT_BASE_SHIFT,
+        help="diffusers_dynamic scheduler: mu at the base image sequence length (256 tokens). Qwen-Image "
+        "config default 0.5.",
+    )
+    parser.add_argument(
+        "--dynamic_max_shift",
+        type=float,
+        default=anima_er_sde_sampling.QWEN_IMAGE_DYNAMIC_SHIFT_MAX_SHIFT,
+        help="diffusers_dynamic scheduler: mu at the max image sequence length (8192 tokens). Qwen-Image "
+        "config default 0.9.",
     )
 
     parser.add_argument("--fp8", action="store_true", help="use fp8 for DiT model")
@@ -222,11 +237,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--scheduler",
         type=str,
-        default="beta57",
+        default="diffusers_dynamic",
         choices=list(SCHEDULER_OPTION_CHOICES),
         help="sigma scheduler: default (flow-shifted linspace), beta57 (RES4LYF beta alpha=0.5/beta=0.7, "
-        "more low-noise emphasis; the default here for Anima), or simple (ComfyUI simple_scheduler, even "
-        "stride over the flow-shifted sigma table)",
+        "more low-noise emphasis), simple (ComfyUI simple_scheduler, even "
+        "stride over the flow-shifted sigma table), diffusers (diffusers FlowMatchEulerDiscreteScheduler "
+        "static-shift schedule using --flow_shift; pair with --sampler euler for the reference "
+        "FlowMatch-Euler path), or diffusers_dynamic (Qwen-Image resolution-aware dynamic shift; ignores "
+        "--flow_shift, computes the shift from image size like Qwen-Image itself; the default here)",
     )
     parser.add_argument("--no_metadata", action="store_true", help="do not save metadata")
     parser.add_argument("--latent_path", type=str, nargs="*", default=None, help="path to latent for decode. no inference")
@@ -343,6 +361,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pag_rescale_mode", type=str, default="full", choices=("full", "partial"),
         help="PAG rescale strategy: 'full' (vs cfg result) or 'partial' (vs conditional). Default 'full'.",
+    )
+    parser.add_argument(
+        "--flow_matched_pag", action="store_true",
+        help="Scale PAG strength across the denoise by the (linear) flow-state scalar (a project heuristic, "
+        "not a published method): effective_pag_scale = pag_scale * (sigma/sigma_max)**curve_exponent * "
+        "strength. Works with any sampler/scheduler (default off).",
+    )
+    parser.add_argument(
+        "--flow_matched_pag_strength", type=float, default=1.0,
+        help="Multiplier on the FlowMatched PAG scalar: 1.0 = scalar as-is, 0.5 = half influence, 2.0 = double (default 1.0)",
+    )
+    parser.add_argument(
+        "--flow_matched_pag_curve_exponent", type=float, default=1.0,
+        help="Shapes the FlowMatched PAG scalar as (sigma/sigma_max)**exponent: 1.0 = linear, <1 keeps PAG "
+        "stronger later, >1 concentrates it at high noise (default 1.0)",
     )
 
     args = parser.parse_args()
@@ -1256,6 +1289,17 @@ def generate_body(
         sigmas = anima_er_sde_sampling.build_beta57_sigmas(args.infer_steps, args.flow_shift, device)
     elif args.scheduler == "simple":
         sigmas = anima_er_sde_sampling.build_simple_sigmas(args.infer_steps, args.flow_shift, device)
+    elif args.scheduler == "diffusers":
+        sigmas = anima_er_sde_sampling.build_diffusers_flowmatch_sigmas(args.infer_steps, args.flow_shift, device)
+    elif args.scheduler == "diffusers_dynamic":
+        # Qwen-Image resolution-aware shift: image_seq_len is the packed image token count the DiT
+        # processes (VAE /8 then patch_spatial 2), i.e. (height // 16) * (width // 16).
+        image_seq_len = (height // 16) * (width // 16)
+        sigmas = anima_er_sde_sampling.build_diffusers_dynamic_flowmatch_sigmas(
+            args.infer_steps, image_seq_len, device,
+            base_shift=float(getattr(args, "dynamic_base_shift", anima_er_sde_sampling.QWEN_IMAGE_DYNAMIC_SHIFT_BASE_SHIFT)),
+            max_shift=float(getattr(args, "dynamic_max_shift", anima_er_sde_sampling.QWEN_IMAGE_DYNAMIC_SHIFT_MAX_SHIFT)),
+        )
     else:
         _timesteps, sigmas = hunyuan_image_utils.get_timesteps_sigmas(args.infer_steps, args.flow_shift, device)
 
@@ -1273,6 +1317,12 @@ def generate_body(
     pag_rescale = float(getattr(args, "pag_rescale", 0.0))
     pag_rescale_mode = str(getattr(args, "pag_rescale_mode", "full"))
     pag_can_run = pag_enabled and pag_scale != 0.0 and len(pag_block_indices) > 0
+
+    # FlowMatched PAG (project heuristic): scale PAG strength across the denoise by a linear flow-state
+    # scalar shaped by an exponent. Off -> effective scale stays pag_scale (existing behavior unchanged).
+    flow_matched_pag_enabled = bool(getattr(args, "flow_matched_pag", False))
+    flow_matched_pag_strength = float(getattr(args, "flow_matched_pag_strength", 1.0))
+    flow_matched_pag_curve_exponent = float(getattr(args, "flow_matched_pag_curve_exponent", 1.0))
 
     def run_velocity_with_cfg(current_latents, sigma_scalar):
         # The Anima DiT consumes the flow sigma (in [0,1]) directly as its time input.
@@ -1296,7 +1346,13 @@ def generate_body(
                     pag_velocity = anima(model_input, time_input, embed, padding_mask=padding_mask)
             finally:
                 anima.disable_soft_pag_perturbation()
-            pag_guidance = (cond_velocity - pag_velocity) * pag_scale
+            effective_pag_scale = pag_scale
+            if flow_matched_pag_enabled:
+                effective_pag_scale *= (
+                    get_flow_pag_scalar(sigma_scalar, sigmas, flow_matched_pag_curve_exponent)
+                    * flow_matched_pag_strength
+                )
+            pag_guidance = (cond_velocity - pag_velocity) * effective_pag_scale
             cfg_velocity = cfg_velocity + rescale_pag_guidance(
                 pag_guidance, cond_velocity, cfg_velocity, pag_rescale, pag_rescale_mode
             )
@@ -1427,6 +1483,22 @@ def rescale_pag_guidance(pag_guidance, cond_prediction, cfg_result, rescale: flo
     factor = std_cond / std_guidance
     factor = rescale * factor + (1.0 - rescale)
     return pag_guidance * factor
+
+
+def get_flow_pag_scalar(current_sigma, sigmas, curve_exponent: float) -> float:
+    """FlowMatched PAG scalar (project heuristic, no published reference).
+
+    A linear function of the current noise level, shaped by an exponent:
+        normalized_sigma = current_sigma / sigmas[0]   # 1.0 at the noisiest step -> 0.0 at the end
+        scalar           = normalized_sigma ** curve_exponent
+    curve_exponent 1.0 is linear; <1 keeps PAG stronger later, >1 concentrates it at high noise. The
+    caller multiplies this by --flow_matched_pag_strength and the base pag_scale.
+    """
+    max_sigma = float(sigmas[0])
+    if max_sigma <= 0.0:
+        return 0.0
+    normalized_sigma = max(0.0, min(1.0, float(current_sigma) / max_sigma))
+    return normalized_sigma ** float(curve_exponent)
 
 
 def get_time_flag():
@@ -2166,6 +2238,22 @@ def select_present_combined_components(all_keys) -> List[dict]:
     ]
 
 
+def combined_checkpoint_baked_vae_is_qwen_compatible(all_keys) -> bool:
+    """True when the checkpoint's baked-in VAE (under 'first_stage_model.') is a Qwen-Image VAE.
+
+    Anima's VAE loaders (qwen_image_autoencoder_kl / _2d) only accept the Qwen-Image VAE, whose keys use
+    the diffusers down_blocks/up_blocks/mid_block namespace. Some all-in-one checkpoints instead bake a
+    foreign VAE (e.g. a Stable-Diffusion AutoencoderKL, whose keys are encoder.down.N.block / mid.attn_1);
+    that VAE cannot be loaded into the Qwen VAE and must be ignored in favor of --vae. Returns False when
+    there is no baked VAE at all (caller should gate on the VAE component actually being present)."""
+    vae_source_prefix = "first_stage_model."
+    baked_vae_subkeys = [key[len(vae_source_prefix):] for key in all_keys if key.startswith(vae_source_prefix)]
+    if not baked_vae_subkeys:
+        return False
+    qwen_vae_namespace_markers = ("down_blocks", "up_blocks", "mid_block")
+    return any(any(marker in subkey for marker in qwen_vae_namespace_markers) for subkey in baked_vae_subkeys)
+
+
 def derive_extracted_models_folder(dit_path: str) -> str:
     """Return the sibling folder (named for the model, next to it) where extracted components live."""
     return os.path.splitext(dit_path)[0]
@@ -2218,6 +2306,17 @@ def prepare_split_models_from_combined_checkpoint(args: argparse.Namespace) -> N
         return
 
     present_components = select_present_combined_components(checkpoint_keys)
+
+    # A baked-in VAE that is not a Qwen-Image VAE (e.g. an SD AutoencoderKL) cannot load into Anima's VAE;
+    # drop it so the explicitly provided --vae is used instead (applies to fresh and cached extractions).
+    baked_vae_is_present = any(component["name"] == "vae" for component in present_components)
+    if baked_vae_is_present and not combined_checkpoint_baked_vae_is_qwen_compatible(checkpoint_keys):
+        present_components = [component for component in present_components if component["name"] != "vae"]
+        if args.vae:
+            logger.warning("Combined checkpoint's baked-in VAE is not a Qwen-Image VAE; ignoring it and using --vae.")
+        else:
+            logger.warning("Combined checkpoint's baked-in VAE is not a Qwen-Image VAE and no --vae was provided; VAE load will fail.")
+
     output_folder = derive_extracted_models_folder(args.dit)
     expected_paths = {
         component["name"]: os.path.join(output_folder, component["filename"]) for component in present_components
@@ -2431,6 +2530,8 @@ def build_generation_settings_dict(args) -> dict:
         "steps": args.infer_steps,
         "guidance_scale": args.guidance_scale,
         "flow_shift": args.flow_shift,
+        "dynamic_base_shift": getattr(args, "dynamic_base_shift", anima_er_sde_sampling.QWEN_IMAGE_DYNAMIC_SHIFT_BASE_SHIFT),
+        "dynamic_max_shift": getattr(args, "dynamic_max_shift", anima_er_sde_sampling.QWEN_IMAGE_DYNAMIC_SHIFT_MAX_SHIFT),
         "seed": args.seed,
         "sampler": args.sampler,
         "scheduler": args.scheduler,
@@ -2451,6 +2552,9 @@ def build_generation_settings_dict(args) -> dict:
         "end_percent": getattr(args, "pag_end_percent", 0.7),
         "rescale": getattr(args, "pag_rescale", 0.2),
         "rescale_mode": getattr(args, "pag_rescale_mode", "full"),
+        "flow_matched_enabled": bool(getattr(args, "flow_matched_pag", False)),
+        "flow_matched_strength": getattr(args, "flow_matched_pag_strength", 1.0),
+        "flow_matched_curve_exponent": getattr(args, "flow_matched_pag_curve_exponent", 1.0),
     }
 
     recorded_lora_rows = build_recorded_lora_rows(args)
