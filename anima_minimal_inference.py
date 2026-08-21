@@ -364,18 +364,30 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--flow_matched_pag", action="store_true",
-        help="Scale PAG strength across the denoise by the (linear) flow-state scalar (a project heuristic, "
-        "not a published method): effective_pag_scale = pag_scale * (sigma/sigma_max)**curve_exponent * "
-        "strength. Works with any sampler/scheduler (default off).",
+        help="Flow-Matched PAG: scale PAG along the fixed sigma/flow schedule "
+        "(effective = (pag_scale + pag_strength_offset) * (1 - flow_matched_pag_strength*(1 - sigma/sigma_max))). "
+        "Default off.",
     )
     parser.add_argument(
-        "--flow_matched_pag_strength", type=float, default=1.0,
-        help="Multiplier on the FlowMatched PAG scalar: 1.0 = scalar as-is, 0.5 = half influence, 2.0 = double (default 1.0)",
+        "--flow_matched_pag_strength", type=float, default=0.8,
+        help="How strongly the sigma schedule suppresses PAG toward the low-noise end: 0 = flat (plain PAG), "
+        "1 = full fade to the offset floor at the end. Suggested range 0.5-1.3 (default 0.8)",
     )
     parser.add_argument(
-        "--flow_matched_pag_curve_exponent", type=float, default=1.0,
-        help="Shapes the FlowMatched PAG scalar as (sigma/sigma_max)**exponent: 1.0 = linear, <1 keeps PAG "
-        "stronger later, >1 concentrates it at high noise (default 1.0)",
+        "--pag_strength_offset", type=float, default=1.0,
+        help="Makeup gain added to the base PAG scale inside the Flow-Matched branch, before the sigma scaling "
+        "(like a compressor's makeup gain). Additive to pag_scale (default 1.0)",
+    )
+    parser.add_argument(
+        "--er_sde_solver_pag", action="store_true",
+        help="ER-SDE Solver PAG: additionally damp/amplify PAG by how much the ER-SDE solver disagreed with "
+        "plain Euler on the previous step. Only affects the er_sde sampler. Default off.",
+    )
+    parser.add_argument(
+        "--er_sde_solver_pag_strength", type=float, default=20.0,
+        help="Multiplier on the ER-SDE solver-disagreement signal: effective *= (1 + strength * disagreement). "
+        ">0 amplifies PAG where the solver corrects hard, <0 damps it, 0 = no effect. The disagreement signal "
+        "is small, so useful magnitudes are large; suggested range 10-80 (default 20.0)",
     )
 
     args = parser.parse_args()
@@ -1318,11 +1330,15 @@ def generate_body(
     pag_rescale_mode = str(getattr(args, "pag_rescale_mode", "full"))
     pag_can_run = pag_enabled and pag_scale != 0.0 and len(pag_block_indices) > 0
 
-    # FlowMatched PAG (project heuristic): scale PAG strength across the denoise by a linear flow-state
-    # scalar shaped by an exponent. Off -> effective scale stays pag_scale (existing behavior unchanged).
+    # Flow-Matched PAG: scale PAG along the fixed sigma schedule. ER-SDE Solver PAG: additionally
+    # damp/amplify PAG by the previous step's solver-vs-Euler disagreement (one-step lag). Off -> plain PAG.
     flow_matched_pag_enabled = bool(getattr(args, "flow_matched_pag", False))
-    flow_matched_pag_strength = float(getattr(args, "flow_matched_pag_strength", 1.0))
-    flow_matched_pag_curve_exponent = float(getattr(args, "flow_matched_pag_curve_exponent", 1.0))
+    flow_matched_pag_strength = float(getattr(args, "flow_matched_pag_strength", 0.8))
+    pag_strength_offset = float(getattr(args, "pag_strength_offset", 1.0))
+    er_sde_solver_pag_enabled = bool(getattr(args, "er_sde_solver_pag", False))
+    er_sde_solver_pag_strength = float(getattr(args, "er_sde_solver_pag_strength", 20.0))
+    max_sigma = float(sigmas[0])
+    er_sde_solver_disagreement_state = {"value": 0.0}
 
     def run_velocity_with_cfg(current_latents, sigma_scalar):
         # The Anima DiT consumes the flow sigma (in [0,1]) directly as its time input.
@@ -1346,11 +1362,15 @@ def generate_body(
                     pag_velocity = anima(model_input, time_input, embed, padding_mask=padding_mask)
             finally:
                 anima.disable_soft_pag_perturbation()
-            effective_pag_scale = pag_scale
             if flow_matched_pag_enabled:
-                effective_pag_scale *= (
-                    get_flow_pag_scalar(sigma_scalar, sigmas, flow_matched_pag_curve_exponent)
-                    * flow_matched_pag_strength
+                effective_pag_scale = compute_flow_matched_pag_scale(
+                    pag_scale, sigma_scalar, max_sigma, flow_matched_pag_strength, pag_strength_offset
+                )
+            else:
+                effective_pag_scale = pag_scale
+            if er_sde_solver_pag_enabled:
+                effective_pag_scale = apply_er_sde_solver_pag_factor(
+                    effective_pag_scale, er_sde_solver_disagreement_state["value"], er_sde_solver_pag_strength
                 )
             pag_guidance = (cond_velocity - pag_velocity) * effective_pag_scale
             cfg_velocity = cfg_velocity + rescale_pag_guidance(
@@ -1366,8 +1386,12 @@ def generate_body(
     # happen here, so holding the GPU lock cannot deadlock against the disk-read lock).
     with serialize_gpu_compute(args, GPU_PHASE_DENOISE):
         if args.sampler == "er_sde":
+            def report_er_sde_solver_disagreement(value):
+                er_sde_solver_disagreement_state["value"] = value
+
             latents = anima_er_sde_sampling.sample_er_sde_rectified_flow(
-                predict_denoised_x0, latents, sigmas, seed=args.seed
+                predict_denoised_x0, latents, sigmas, seed=args.seed,
+                report_solver_disagreement=report_er_sde_solver_disagreement if er_sde_solver_pag_enabled else None,
             ).to(latents.dtype)
         elif args.sampler == "euler_ancestral":
             latents = anima_er_sde_sampling.sample_euler_ancestral_rectified_flow(
@@ -1485,20 +1509,42 @@ def rescale_pag_guidance(pag_guidance, cond_prediction, cfg_result, rescale: flo
     return pag_guidance * factor
 
 
-def get_flow_pag_scalar(current_sigma, sigmas, curve_exponent: float) -> float:
-    """FlowMatched PAG scalar (project heuristic, no published reference).
+def compute_flow_matched_pag_scale(
+    base_pag_scale: float,
+    current_sigma,
+    max_sigma,
+    flow_matched_strength: float,
+    pag_strength_offset: float,
+) -> float:
+    """Flow-Matched PAG effective scale: scale PAG along the fixed sigma/flow schedule.
 
-    A linear function of the current noise level, shaped by an exponent:
-        normalized_sigma = current_sigma / sigmas[0]   # 1.0 at the noisiest step -> 0.0 at the end
-        scalar           = normalized_sigma ** curve_exponent
-    curve_exponent 1.0 is linear; <1 keeps PAG stronger later, >1 concentrates it at high noise. The
-    caller multiplies this by --flow_matched_pag_strength and the base pag_scale.
+    flow_value  = current_sigma / max_sigma            # 1.0 at the noisiest step -> 0.0 at the end
+    modulation  = 1 - flow_matched_strength * (1 - flow_value)
+    effective   = (base_pag_scale + pag_strength_offset) * modulation
+
+    pag_strength_offset is makeup gain applied to the base BEFORE the sigma scaling (like a compressor's
+    makeup gain). flow_matched_strength scales how strongly the schedule suppresses PAG toward the end:
+    0 = flat (plain PAG), 1 = full fade toward the low-noise end. No exponent (the sigma schedule already
+    carries the curve).
     """
-    max_sigma = float(sigmas[0])
-    if max_sigma <= 0.0:
-        return 0.0
-    normalized_sigma = max(0.0, min(1.0, float(current_sigma) / max_sigma))
-    return normalized_sigma ** float(curve_exponent)
+    max_sigma_value = float(max_sigma)
+    if max_sigma_value <= 0.0:
+        flow_value = 0.0
+    else:
+        flow_value = max(0.0, min(1.0, float(current_sigma) / max_sigma_value))
+    modulation = 1.0 - float(flow_matched_strength) * (1.0 - flow_value)
+    return (float(base_pag_scale) + float(pag_strength_offset)) * modulation
+
+
+def apply_er_sde_solver_pag_factor(effective_pag_scale: float, solver_disagreement: float, solver_pag_strength: float) -> float:
+    """ER-SDE Solver PAG: damp/amplify PAG by how much ER-SDE disagreed with plain Euler last step.
+
+    effective * (1 + solver_pag_strength * solver_disagreement)
+    solver_disagreement is ||full_update - euler_update|| / (||euler_update|| + eps) from the previous
+    step (one-step lag). solver_pag_strength > 0 amplifies PAG where the solver is correcting hard, < 0
+    damps it, 0 = no effect. Only meaningful with the er_sde sampler (other samplers report 0).
+    """
+    return float(effective_pag_scale) * (1.0 + float(solver_pag_strength) * float(solver_disagreement))
 
 
 def get_time_flag():
@@ -2553,8 +2599,10 @@ def build_generation_settings_dict(args) -> dict:
         "rescale": getattr(args, "pag_rescale", 0.2),
         "rescale_mode": getattr(args, "pag_rescale_mode", "full"),
         "flow_matched_enabled": bool(getattr(args, "flow_matched_pag", False)),
-        "flow_matched_strength": getattr(args, "flow_matched_pag_strength", 1.0),
-        "flow_matched_curve_exponent": getattr(args, "flow_matched_pag_curve_exponent", 1.0),
+        "flow_matched_strength": getattr(args, "flow_matched_pag_strength", 0.8),
+        "strength_offset": getattr(args, "pag_strength_offset", 1.0),
+        "er_sde_solver_enabled": bool(getattr(args, "er_sde_solver_pag", False)),
+        "er_sde_solver_strength": getattr(args, "er_sde_solver_pag_strength", 20.0),
     }
 
     recorded_lora_rows = build_recorded_lora_rows(args)

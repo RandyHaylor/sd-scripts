@@ -254,6 +254,7 @@ def sample_er_sde_rectified_flow(
     seed=None,
     s_noise: float = 1.0,
     max_stage: int = 3,
+    report_solver_disagreement=None,
 ) -> torch.Tensor:
     """ER-SDE-Solver-3 adapted for a rectified-flow (CONST) model.
 
@@ -265,6 +266,11 @@ def sample_er_sde_rectified_flow(
         seed: optional int for the stochastic noise injection.
         s_noise: scale on injected noise (1.0 = standard ER-SDE).
         max_stage: 1/2/3 selects ER-SDE-Solver order; history ramps stages up as steps accumulate.
+        report_solver_disagreement: optional callable(float). Called once per step with the relative
+            magnitude of the solver's higher-order correction over the stage-1 Euler update
+            (||full_update - euler_update|| / (||euler_update|| + eps)) -- i.e. how strongly ER-SDE
+            disagreed with plain Euler this step. Consumers (e.g. ER-SDE Solver PAG) use it with a
+            one-step lag, since it is only known after this step's denoise has already run.
     """
     device = latents.device
 
@@ -304,6 +310,8 @@ def sample_er_sde_rectified_flow(
 
         if sigmas[i + 1] == 0:
             latents = denoised
+            if report_solver_disagreement is not None:
+                report_solver_disagreement(0.0)
         else:
             er_lambda_s, er_lambda_t = er_lambdas[i], er_lambdas[i + 1]
             alpha_s = sigmas[i] / er_lambda_s
@@ -311,8 +319,9 @@ def sample_er_sde_rectified_flow(
             r_alpha = alpha_t / alpha_s
             r = noise_scaler(er_lambda_t) / noise_scaler(er_lambda_s)
 
-            # Stage 1 (Euler)
-            latents = r_alpha * r * latents + alpha_t * (1 - r) * denoised
+            # Stage 1 (Euler). Keep the pure Euler update to measure how far the higher-order stages move.
+            euler_update = r_alpha * r * latents + alpha_t * (1 - r) * denoised
+            latents = euler_update
 
             if stage_used >= 2:
                 dt = er_lambda_t - er_lambda_s
@@ -331,6 +340,13 @@ def sample_er_sde_rectified_flow(
                     denoised_u = (denoised_d - old_denoised_d) / ((er_lambda_s - er_lambdas[i - 2]) / 2)
                     latents = latents + alpha_t * ((dt ** 2) / 2 + s_u * noise_scaler(er_lambda_t)) * denoised_u
                 old_denoised_d = denoised_d
+
+            # Solver disagreement = relative size of the higher-order correction vs the Euler update
+            # (measured on the deterministic update, before the stochastic renoise below).
+            if report_solver_disagreement is not None:
+                correction_norm = torch.linalg.vector_norm(latents - euler_update)
+                euler_norm = torch.linalg.vector_norm(euler_update)
+                report_solver_disagreement(float(correction_norm / (euler_norm + 1e-8)))
 
             if s_noise > 0:
                 injected = (er_lambda_t ** 2 - er_lambda_s ** 2 * r ** 2).sqrt().nan_to_num(nan=0.0)

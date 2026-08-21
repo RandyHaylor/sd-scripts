@@ -46,7 +46,8 @@ from anima_minimal_inference import (
     parse_pag_index_spec,
     pag_is_active_for_sigma,
     rescale_pag_guidance,
-    get_flow_pag_scalar,
+    compute_flow_matched_pag_scale,
+    apply_er_sde_solver_pag_factor,
     hold_exclusive_cross_process_file_lock,
     serialize_model_file_disk_reads,
     serialize_model_loading_phase,
@@ -488,27 +489,51 @@ def test_build_diffusers_dynamic_flowmatch_sigmas_varies_with_shift_endpoints():
     assert not torch.equal(default_shift, custom_shift)
 
 
-def test_get_flow_pag_scalar_linear_is_normalized_sigma():
-    sigmas = torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0], dtype=torch.float32)
-    # curve_exponent 1.0 -> scalar == sigma / sigmas[0]; sigmas[0] is 1.0 here so scalar == sigma.
-    assert abs(get_flow_pag_scalar(sigmas[0], sigmas, 1.0) - 1.0) < 1e-6
-    assert abs(get_flow_pag_scalar(sigmas[2], sigmas, 1.0) - 0.5) < 1e-6
-    assert abs(get_flow_pag_scalar(sigmas[4], sigmas, 1.0) - 0.0) < 1e-6
+def test_compute_flow_matched_pag_scale_baseline_matches_plain_pag_shape():
+    # strength 1, offset 0 -> (pag_scale)*flow_value; at max sigma = pag_scale, at end = 0.
+    assert abs(compute_flow_matched_pag_scale(4.0, 1.0, 1.0, 1.0, 0.0) - 4.0) < 1e-6
+    assert abs(compute_flow_matched_pag_scale(4.0, 0.5, 1.0, 1.0, 0.0) - 2.0) < 1e-6
+    assert abs(compute_flow_matched_pag_scale(4.0, 0.0, 1.0, 1.0, 0.0) - 0.0) < 1e-6
 
 
-def test_get_flow_pag_scalar_curve_exponent_shapes_curve():
-    sigmas = torch.tensor([2.0, 1.0, 0.0], dtype=torch.float32)  # sigmas[0]=2.0 -> normalized halves it
-    # at current_sigma 1.0, normalized = 0.5. exponent 2 -> 0.25; exponent 0.5 -> ~0.707.
-    assert abs(get_flow_pag_scalar(torch.tensor(1.0), sigmas, 2.0) - 0.25) < 1e-6
-    assert abs(get_flow_pag_scalar(torch.tensor(1.0), sigmas, 0.5) - (0.5 ** 0.5)) < 1e-6
+def test_compute_flow_matched_pag_scale_offset_is_makeup_before_scaling():
+    # offset adds to base before the sigma scaling: (4+1)*modulation.
+    # strength 1 at mid sigma 0.5 -> modulation 0.5 -> 5*0.5 = 2.5.
+    assert abs(compute_flow_matched_pag_scale(4.0, 0.5, 1.0, 1.0, 1.0) - 2.5) < 1e-6
+    # strength 0 -> flat modulation 1 -> (4+1) everywhere regardless of sigma.
+    assert abs(compute_flow_matched_pag_scale(4.0, 0.0, 1.0, 0.0, 1.0) - 5.0) < 1e-6
 
 
-def test_get_flow_pag_scalar_clamps_and_handles_zero_max():
-    sigmas = torch.tensor([1.0, 0.5, 0.0], dtype=torch.float32)
-    # current_sigma above max clamps to 1.0
-    assert get_flow_pag_scalar(torch.tensor(5.0), sigmas, 1.0) == 1.0
-    # degenerate zero-max schedule returns 0.0 rather than dividing by zero
-    assert get_flow_pag_scalar(torch.tensor(0.0), torch.tensor([0.0, 0.0]), 1.0) == 0.0
+def test_compute_flow_matched_pag_scale_clamps_and_handles_zero_max():
+    # current_sigma above max clamps flow_value to 1.0 -> full base (no suppression).
+    assert abs(compute_flow_matched_pag_scale(4.0, 5.0, 1.0, 1.0, 0.0) - 4.0) < 1e-6
+    # zero max sigma -> flow_value 0 -> full suppression at strength 1 -> 0.
+    assert compute_flow_matched_pag_scale(4.0, 1.0, 0.0, 1.0, 0.0) == 0.0
+
+
+def test_apply_er_sde_solver_pag_factor_amplifies_and_damps():
+    # (1 + strength*disagreement) multiplier.
+    assert abs(apply_er_sde_solver_pag_factor(4.0, 0.0, 1.0) - 4.0) < 1e-6   # no disagreement -> unchanged
+    assert abs(apply_er_sde_solver_pag_factor(4.0, 0.5, 1.0) - 6.0) < 1e-6   # amplify
+    assert abs(apply_er_sde_solver_pag_factor(4.0, 0.5, -1.0) - 2.0) < 1e-6  # damp with negative strength
+    assert abs(apply_er_sde_solver_pag_factor(4.0, 0.5, 0.0) - 4.0) < 1e-6   # strength 0 -> no effect
+
+
+def test_er_sde_sampler_reports_solver_disagreement_non_negative_finite():
+    import math
+
+    reported = []
+    # denoiser that pushes x0 away from x so higher-order stages have something to correct.
+    def moving_denoiser(x, sigma):
+        return x * 0.5
+
+    sigmas = torch.tensor([0.9, 0.6, 0.3, 0.0], dtype=torch.float32)
+    latents = torch.randn(1, 4, 1, 8, 8, dtype=torch.float32)
+    anima_er_sde_sampling.sample_er_sde_rectified_flow(
+        moving_denoiser, latents, sigmas, seed=0, report_solver_disagreement=reported.append
+    )
+    assert len(reported) == len(sigmas) - 1
+    assert all(isinstance(v, float) and math.isfinite(v) and v >= 0.0 for v in reported), reported
 
 
 def test_euler_ancestral_identity_denoiser_no_eta_returns_input():
@@ -1203,8 +1228,10 @@ def test_generation_settings_dict_records_pag_defaults_disabled_when_args_lack_p
     assert settings["pag"]["rescale"] == 0.2
     assert settings["pag"]["rescale_mode"] == "full"
     assert settings["pag"]["flow_matched_enabled"] is False
-    assert settings["pag"]["flow_matched_strength"] == 1.0
-    assert settings["pag"]["flow_matched_curve_exponent"] == 1.0
+    assert settings["pag"]["flow_matched_strength"] == 0.8
+    assert settings["pag"]["strength_offset"] == 1.0
+    assert settings["pag"]["er_sde_solver_enabled"] is False
+    assert settings["pag"]["er_sde_solver_strength"] == 20.0
 
 
 def test_generation_settings_dict_records_enabled_pag_values():
@@ -1220,7 +1247,9 @@ def test_generation_settings_dict_records_enabled_pag_values():
     args.pag_rescale_mode = "partial"
     args.flow_matched_pag = True
     args.flow_matched_pag_strength = 0.5
-    args.flow_matched_pag_curve_exponent = 2.0
+    args.pag_strength_offset = 2.0
+    args.er_sde_solver_pag = True
+    args.er_sde_solver_pag_strength = 1.5
     settings = build_generation_settings_dict(args)
     assert settings["pag"] == {
         "enabled": True,
@@ -1234,7 +1263,9 @@ def test_generation_settings_dict_records_enabled_pag_values():
         "rescale_mode": "partial",
         "flow_matched_enabled": True,
         "flow_matched_strength": 0.5,
-        "flow_matched_curve_exponent": 2.0,
+        "strength_offset": 2.0,
+        "er_sde_solver_enabled": True,
+        "er_sde_solver_strength": 1.5,
     }
 
 
