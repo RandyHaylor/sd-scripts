@@ -2,8 +2,12 @@
 
 import argparse
 import gc
+import glob
 import math
 import os
+import shlex
+import subprocess
+import sys
 import time
 from typing import Optional
 
@@ -26,6 +30,8 @@ setup_logging()
 import logging
 
 logger = logging.getLogger(__name__)
+
+EXTERNAL_SAMPLE_CHECKPOINT_FLUSH_WAIT_SECONDS = 2
 
 
 # Anima-specific training arguments
@@ -203,6 +209,20 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
         "--cuda_cudnn_benchmark",
         action="store_true",
         help="Enable cuDNN benchmark mode (may improve performance) / cuDNNのベンチマークモードを有効にする（パフォーマンスが向上する可能性がある）",
+    )
+    parser.add_argument(
+        "--sample_via_external_inference",
+        action="store_true",
+        help="Generate training sample images by invoking sd-scripts/anima_minimal_inference.py once per "
+        "sample-prompt line (each line is the full CLI argument string for that script) instead of the "
+        "in-process sampler. The newest saved LoRA checkpoint plus the sample output dir are injected as "
+        "--lora_weight / --lora_multiplier / --save_path.",
+    )
+    parser.add_argument(
+        "--sample_external_parallel",
+        action="store_true",
+        help="With --sample_via_external_inference, launch each sample as a fire-and-forget subprocess so "
+        "training does not pause. The sample process shares the GPU with training.",
     )
 
 
@@ -513,6 +533,91 @@ def do_sample(
     return x
 
 
+def find_newest_lora_checkpoint(output_dir: str) -> Optional[str]:
+    """Path of the most recently modified `*.safetensors` under `output_dir`, or None if there is none.
+
+    Files under a `sample` subdirectory are ignored so generated-sample sidecars can never be mistaken
+    for a trained checkpoint.
+    """
+    sample_subdirectory_fragment = os.sep + "sample" + os.sep
+    checkpoint_paths = [
+        path
+        for path in glob.glob(os.path.join(output_dir, "**", "*.safetensors"), recursive=True)
+        if sample_subdirectory_fragment not in path
+    ]
+    if not checkpoint_paths:
+        return None
+    return max(checkpoint_paths, key=os.path.getmtime)
+
+
+def read_external_inference_sample_prompt_lines(sample_prompts_path: str) -> list:
+    """Raw prompt-file lines, each a complete `anima_minimal_inference.py` argument string.
+
+    Blank lines and `#` comment lines are dropped. The lines are deliberately NOT parsed with
+    `sampling.load_prompts`, which would strip the kohya-style sample flags.
+    """
+    with open(sample_prompts_path, "r", encoding="utf-8") as prompt_file:
+        raw_lines = prompt_file.read().splitlines()
+    return [line.strip() for line in raw_lines if line.strip() and not line.strip().startswith("#")]
+
+
+def build_external_inference_sample_command(
+    python_executable: str,
+    inference_script_path: str,
+    prompt_line: str,
+    lora_checkpoint_path: Optional[str],
+    save_dir: str,
+    lora_multiplier: float = 1.0,
+) -> list:
+    """argv for one external sample render: the prompt line verbatim plus the injected LoRA and save path.
+
+    `lora_checkpoint_path` of None omits the LoRA flags entirely (base-model-only sample).
+    """
+    argv = [python_executable, inference_script_path] + shlex.split(prompt_line)
+    if lora_checkpoint_path:
+        argv += ["--lora_weight", lora_checkpoint_path, "--lora_multiplier", str(lora_multiplier)]
+    argv += ["--save_path", save_dir]
+    return argv
+
+
+def run_external_inference_samples(args: argparse.Namespace):
+    """Render training samples by invoking `anima_minimal_inference.py` once per sample-prompt line.
+
+    Waits briefly so a checkpoint saved on this same step has finished flushing, then points every
+    sample at the newest checkpoint on disk. With `--sample_external_parallel` each render is launched
+    fire-and-forget and training continues immediately; otherwise each render is awaited in turn.
+    """
+    if not os.path.isfile(args.sample_prompts):
+        logger.error(f"No prompt file: {args.sample_prompts}")
+        return
+
+    save_dir = os.path.join(args.output_dir, "sample")
+    os.makedirs(save_dir, exist_ok=True)
+
+    time.sleep(EXTERNAL_SAMPLE_CHECKPOINT_FLUSH_WAIT_SECONDS)
+    lora_checkpoint_path = find_newest_lora_checkpoint(args.output_dir)
+    if lora_checkpoint_path is None:
+        logger.warning(
+            f"No saved LoRA checkpoint under {args.output_dir} yet; skipping external sample generation. "
+            "External samples use the latest saved checkpoint, so they start after the first save."
+        )
+        return
+    logger.info(f"External sample generation using checkpoint: {lora_checkpoint_path}")
+
+    inference_script_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "anima_minimal_inference.py")
+    launch_in_parallel = getattr(args, "sample_external_parallel", False)
+
+    for prompt_line in read_external_inference_sample_prompt_lines(args.sample_prompts):
+        command = build_external_inference_sample_command(
+            sys.executable, inference_script_path, prompt_line, lora_checkpoint_path, save_dir
+        )
+        logger.info(f"Launching external sample: {' '.join(command)}")
+        if launch_in_parallel:
+            subprocess.Popen(command)
+        else:
+            subprocess.run(command, check=False)
+
+
 def sample_images(
     accelerator: Accelerator,
     args: argparse.Namespace,
@@ -551,6 +656,11 @@ def sample_images(
                 return
 
     logger.info(f"Generating sample images at step {steps}")
+
+    if getattr(args, "sample_via_external_inference", False):
+        run_external_inference_samples(args)
+        return
+
     if not os.path.isfile(args.sample_prompts) and sample_prompts_te_outputs is None:
         logger.error(f"No prompt file: {args.sample_prompts}")
         return

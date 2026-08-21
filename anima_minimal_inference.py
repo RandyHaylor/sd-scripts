@@ -1446,6 +1446,17 @@ def resolve_random_seed(seed_value: Optional[int]) -> int:
     return seed_value
 
 
+def resolve_prompt_args_seed_in_place(prompt_args: argparse.Namespace) -> int:
+    """Materialize a randomization request (None or -1) into a concrete seed on prompt_args.
+
+    Called before the output file name and the settings sidecar are produced so both record the seed
+    that is actually used for denoising rather than the request marker. Already-concrete seeds are
+    left untouched, so calling this more than once is safe.
+    """
+    prompt_args.seed = resolve_random_seed(prompt_args.seed)
+    return prompt_args.seed
+
+
 def parse_pag_index_spec(spec) -> List[int]:
     """Parse an Anima-Safe PAG index spec (blocks or heads) into a sorted, de-duplicated int list.
 
@@ -1794,6 +1805,7 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
 
         all_prompt_args_list = [apply_overrides(args, pd) for pd in prompts_data]  # Create all arg instances first
         for prompt_args in all_prompt_args_list:
+            resolve_prompt_args_seed_in_place(prompt_args)  # each prompt gets its own concrete seed
             check_inputs(prompt_args)  # Validate each prompt's height/width
 
         # 2. Load DiT Model once
@@ -2029,8 +2041,7 @@ def process_folder_streaming(args: argparse.Namespace) -> None:
                 continue
 
             prompt_args = apply_overrides(args, overrides)
-            if prompt_args.seed is None:
-                prompt_args.seed = random.randint(0, 2**32 - 1)
+            resolve_prompt_args_seed_in_place(prompt_args)
             if pre_prompt_neg:
                 prompt_args.negative_prompt = pre_prompt_neg
             prompt_args.current_source_image_path = os.path.join(folder, file_name)

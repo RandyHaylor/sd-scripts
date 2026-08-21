@@ -8,6 +8,11 @@ from PIL import Image, PngImagePlugin
 from library import anima_er_sde_sampling
 from library import strategy_base
 from library.anima_models import apply_soft_pag_attention_perturbation
+from library.anima_train_utils import (
+    build_external_inference_sample_command,
+    find_newest_lora_checkpoint,
+    read_external_inference_sample_prompt_lines,
+)
 
 from anima_minimal_inference import (
     SAMPLER_OPTION_CHOICES,
@@ -43,6 +48,7 @@ from anima_minimal_inference import (
     read_png_parsed_metadata,
     read_png_prompt_overrides,
     resolve_random_seed,
+    resolve_prompt_args_seed_in_place,
     parse_pag_index_spec,
     pag_is_active_for_sigma,
     rescale_pag_guidance,
@@ -227,6 +233,38 @@ def test_resolve_random_seed_none_is_random_in_range():
 def test_resolve_random_seed_minus_one_is_random_in_range():
     seed = resolve_random_seed(-1)
     assert 0 <= seed <= 2**32 - 1
+
+
+def test_resolve_prompt_args_seed_in_place_keeps_explicit_seed():
+    prompt_args = argparse.Namespace(seed=42)
+    assert resolve_prompt_args_seed_in_place(prompt_args) == 42
+    assert prompt_args.seed == 42
+
+
+def test_resolve_prompt_args_seed_in_place_materializes_random_request():
+    for randomization_request in (None, -1):
+        prompt_args = argparse.Namespace(seed=randomization_request)
+        resolved_seed = resolve_prompt_args_seed_in_place(prompt_args)
+        assert 0 <= resolved_seed <= 2**32 - 1
+        assert prompt_args.seed == resolved_seed
+
+
+def test_resolve_prompt_args_seed_in_place_gives_each_prompt_its_own_seed():
+    prompt_args_namespaces = [argparse.Namespace(seed=-1) for _ in range(20)]
+    for prompt_args in prompt_args_namespaces:
+        resolve_prompt_args_seed_in_place(prompt_args)
+    assert len({prompt_args.seed for prompt_args in prompt_args_namespaces}) > 1
+
+
+def test_generation_settings_dict_records_resolved_seed_not_random_request():
+    args = build_minimal_generation_args_namespace()
+    args.seed = -1
+    resolve_prompt_args_seed_in_place(args)
+
+    settings = build_generation_settings_dict(args)
+    assert settings["seed"] == args.seed
+    assert settings["seed"] != -1
+    assert 0 <= settings["seed"] <= 2**32 - 1
 
 
 def _collect_streamed(items, usable_map, prompt_count, skip_first=0):
@@ -1525,6 +1563,76 @@ def test_apply_soft_pag_attention_perturbation_blends_toward_value():
     per_head = one_head.reshape(1, 4, n_heads, head_dim)
     assert torch.allclose(per_head[:, :, 0, :], torch.ones(1, 4, head_dim))
     assert torch.allclose(per_head[:, :, 1, :], torch.zeros(1, 4, head_dim))
+
+
+def test_build_external_inference_sample_command_injects_lora_and_save_path():
+    argv = build_external_inference_sample_command(
+        "/venv/bin/python",
+        "/repo/anima_minimal_inference.py",
+        '--prompt "a cat, detailed" --infer_steps 8',
+        "/out/model-000005.safetensors",
+        "/out/sample",
+        lora_multiplier=1.0,
+    )
+    assert argv[:2] == ["/venv/bin/python", "/repo/anima_minimal_inference.py"]
+    assert argv[2:4] == ["--prompt", "a cat, detailed"]  # shlex keeps the quoted prompt as one token
+    assert argv[4:6] == ["--infer_steps", "8"]
+    assert argv[6:] == [
+        "--lora_weight",
+        "/out/model-000005.safetensors",
+        "--lora_multiplier",
+        "1.0",
+        "--save_path",
+        "/out/sample",
+    ]
+
+
+def test_build_external_inference_sample_command_omits_lora_flags_without_checkpoint():
+    argv = build_external_inference_sample_command(
+        "python", "/repo/anima_minimal_inference.py", "--prompt hi", None, "/out/sample"
+    )
+    assert "--lora_weight" not in argv
+    assert "--lora_multiplier" not in argv
+    assert argv[-2:] == ["--save_path", "/out/sample"]
+
+
+def test_find_newest_lora_checkpoint_returns_most_recently_modified(tmp_path):
+    older = tmp_path / "run-000001.safetensors"
+    newer = tmp_path / "run-000002.safetensors"
+    older.write_bytes(b"a")
+    newer.write_bytes(b"b")
+    os.utime(older, (1_000_000, 1_000_000))
+    os.utime(newer, (2_000_000, 2_000_000))
+
+    assert find_newest_lora_checkpoint(str(tmp_path)) == str(newer)
+
+
+def test_find_newest_lora_checkpoint_none_when_no_checkpoints(tmp_path):
+    assert find_newest_lora_checkpoint(str(tmp_path)) is None
+
+
+def test_find_newest_lora_checkpoint_ignores_sample_subdirectory(tmp_path):
+    checkpoint = tmp_path / "run-000001.safetensors"
+    checkpoint.write_bytes(b"a")
+    os.utime(checkpoint, (1_000_000, 1_000_000))
+    sample_dir = tmp_path / "sample"
+    sample_dir.mkdir()
+    stray_in_sample_dir = sample_dir / "stray.safetensors"
+    stray_in_sample_dir.write_bytes(b"b")
+    os.utime(stray_in_sample_dir, (2_000_000, 2_000_000))
+
+    assert find_newest_lora_checkpoint(str(tmp_path)) == str(checkpoint)
+
+
+def test_read_external_inference_sample_prompt_lines_keeps_raw_lines_and_drops_blanks_and_comments(tmp_path):
+    prompt_file = tmp_path / "prompt.txt"
+    prompt_file.write_text(
+        '# a comment\n\n--prompt "a cat" --width 512 --sampler er_sde\n   \n--prompt "a dog" --pag\n',
+        encoding="utf-8",
+    )
+
+    lines = read_external_inference_sample_prompt_lines(str(prompt_file))
+    assert lines == ['--prompt "a cat" --width 512 --sampler er_sde', '--prompt "a dog" --pag']
 
 
 if __name__ == "__main__":
