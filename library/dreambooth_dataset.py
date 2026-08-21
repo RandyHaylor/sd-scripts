@@ -8,6 +8,7 @@ imports the abstract :class:`~library.dataset.BaseDataset` and its
 import glob
 import json
 import logging
+import math
 import os
 from typing import List, Optional, Sequence, Tuple
 
@@ -25,6 +26,18 @@ from library.utils import setup_logging
 
 setup_logging()
 logger = logging.getLogger(__name__)
+
+
+def compute_regularization_sample_budget(num_train_images: int, regularization_to_training_sample_ratio: float) -> int:
+    """How many regularization samples the repeat-balancing loop is allowed to register.
+
+    A ratio of 1.0 matches the training sample count, which is the historical behavior. Lower
+    values give regularization images proportionally fewer optimizer steps; 0 disables them.
+    Rounds up so a ratio never yields a smaller share than requested.
+    """
+    if regularization_to_training_sample_ratio <= 0:
+        return 0
+    return math.ceil(num_train_images * regularization_to_training_sample_ratio)
 
 
 class DreamBoothDataset(BaseDataset):
@@ -46,6 +59,7 @@ class DreamBoothDataset(BaseDataset):
         bucket_reso_steps: int,
         bucket_no_upscale: bool,
         prior_loss_weight: float,
+        regularization_to_training_sample_ratio: float,
         train_inpainting: bool,
         debug_dataset: bool,
         validation_split: float,
@@ -67,6 +81,7 @@ class DreamBoothDataset(BaseDataset):
         self.batch_size = batch_size
         self.size = min(self.width, self.height)  # 短いほう
         self.prior_loss_weight = prior_loss_weight
+        self.regularization_to_training_sample_ratio = regularization_to_training_sample_ratio
         self.latents_cache = None
         self.is_training_dataset = is_training_dataset
         self.validation_seed = validation_seed
@@ -321,8 +336,16 @@ class DreamBoothDataset(BaseDataset):
 
         self.num_train_images = num_train_images
 
+        regularization_sample_budget = compute_regularization_sample_budget(
+            num_train_images, self.regularization_to_training_sample_ratio
+        )
+
         logger.info(f"{num_reg_images} reg images with repeats.")
-        if num_train_images < num_reg_images:
+        logger.info(
+            f"reg sample budget: {regularization_sample_budget}"
+            f" (ratio {self.regularization_to_training_sample_ratio} of {num_train_images} train samples)"
+        )
+        if regularization_sample_budget < num_reg_images:
             logger.warning("some of reg images are not used / 正則化画像の数が多いので、一部使用されない正則化画像があります")
 
         if num_reg_images == 0:
@@ -331,7 +354,7 @@ class DreamBoothDataset(BaseDataset):
             # num_repeatsを計算する：どうせ大した数ではないのでループで処理する
             n = 0
             first_loop = True
-            while n < num_train_images:
+            while n < regularization_sample_budget:
                 for info, subset in reg_infos:
                     if first_loop:
                         self.register_image(info, subset)
@@ -339,7 +362,7 @@ class DreamBoothDataset(BaseDataset):
                     else:
                         info.num_repeats += 1  # rewrite registered info
                         n += 1
-                    if n >= num_train_images:
+                    if n >= regularization_sample_budget:
                         break
                 first_loop = False
 

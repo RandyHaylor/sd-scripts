@@ -121,6 +121,7 @@ class DreamBoothDatasetParams(BaseDatasetParams):
     bucket_reso_steps: int = 64
     bucket_no_upscale: bool = False
     prior_loss_weight: float = 1.0
+    regularization_to_training_sample_ratio: float = 1.0
 
 @dataclass
 class FineTuningDatasetParams(BaseDatasetParams):
@@ -248,6 +249,7 @@ class ConfigSanitizer:
         "network_multiplier": float,
         "resize_interpolation": str,
         "skip_image_resolution": functools.partial(__validate_and_convert_scalar_or_twodim.__func__, int),
+        "regularization_to_training_sample_ratio": Any(float, int),
     }
 
     # options handled by argparse but not handled by user config
