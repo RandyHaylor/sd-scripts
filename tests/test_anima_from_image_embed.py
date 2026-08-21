@@ -13,6 +13,7 @@ from library.anima_train_utils import (
     find_newest_lora_checkpoint,
     read_external_inference_sample_prompt_lines,
 )
+from library.sampling import resolve_sample_output_directory_for_prompt_index
 
 from anima_minimal_inference import (
     SAMPLER_OPTION_CHOICES,
@@ -1622,6 +1623,20 @@ def test_find_newest_lora_checkpoint_ignores_sample_subdirectory(tmp_path):
     os.utime(stray_in_sample_dir, (2_000_000, 2_000_000))
 
     assert find_newest_lora_checkpoint(str(tmp_path)) == str(checkpoint)
+
+
+def test_first_sample_prompt_stays_in_the_sample_root(tmp_path):
+    assert resolve_sample_output_directory_for_prompt_index(str(tmp_path), 0) == str(tmp_path)
+
+
+def test_later_sample_prompts_get_a_subfolder_named_for_their_index(tmp_path):
+    assert resolve_sample_output_directory_for_prompt_index(str(tmp_path), 1) == os.path.join(str(tmp_path), "1")
+    assert resolve_sample_output_directory_for_prompt_index(str(tmp_path), 7) == os.path.join(str(tmp_path), "7")
+
+
+def test_sample_prompt_subfolder_is_created(tmp_path):
+    created_directory = resolve_sample_output_directory_for_prompt_index(str(tmp_path), 3)
+    assert os.path.isdir(created_directory)
 
 
 def test_read_external_inference_sample_prompt_lines_keeps_raw_lines_and_drops_blanks_and_comments(tmp_path):

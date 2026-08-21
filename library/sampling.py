@@ -244,6 +244,20 @@ def load_prompts(prompt_file: str) -> List[Dict]:
     return prompts
 
 
+def resolve_sample_output_directory_for_prompt_index(sample_dir: str, prompt_index: int) -> str:
+    """Where a sample image belongs, given its prompt's position in the sample-prompt file.
+
+    The first prompt writes into the sample directory itself; every later prompt gets its own
+    subdirectory named for the index that also appears in the file name, so one prompt's
+    progression over training can be viewed without the other prompts interleaved.
+    """
+    if prompt_index <= 0:
+        return sample_dir
+    prompt_specific_directory = os.path.join(sample_dir, str(prompt_index))
+    os.makedirs(prompt_specific_directory, exist_ok=True)
+    return prompt_specific_directory
+
+
 def sample_images_common(
     pipe_class,
     accelerator: Accelerator,
@@ -491,7 +505,7 @@ def sample_image_inference(
     seed_suffix = "" if seed is None else f"_{seed}"
     i: int = prompt_dict["enum"]
     img_filename = f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{i:02d}_{ts_str}{seed_suffix}.png"
-    image.save(os.path.join(save_dir, img_filename))
+    image.save(os.path.join(resolve_sample_output_directory_for_prompt_index(save_dir, i), img_filename))
 
     # send images to wandb if enabled
     if "wandb" in [tracker.name for tracker in accelerator.trackers]:
