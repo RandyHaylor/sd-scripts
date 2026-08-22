@@ -781,19 +781,9 @@ def train(args):
                 progress_bar.update(1)
                 global_step += 1
 
-                sdxl_train_util.sample_images(
-                    accelerator,
-                    args,
-                    None,
-                    global_step,
-                    accelerator.device,
-                    vae,
-                    tokenizers,
-                    [text_encoder1, text_encoder2],
-                    unet,
-                )
-
                 # 指定ステップごとにモデルを保存
+                # Saving runs before sampling: sampling allocates far more VRAM than the save, so an
+                # OOM there must not cost the checkpoint for the step that already finished.
                 if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
@@ -816,6 +806,18 @@ def train(args):
                             logit_scale,
                             ckpt_info,
                         )
+
+                sdxl_train_util.sample_images(
+                    accelerator,
+                    args,
+                    None,
+                    global_step,
+                    accelerator.device,
+                    vae,
+                    tokenizers,
+                    [text_encoder1, text_encoder2],
+                    unet,
+                )
 
             current_loss = loss.detach().item()  # 平均なのでbatch sizeは関係ないはず
             if len(accelerator.trackers) > 0:

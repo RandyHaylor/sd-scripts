@@ -1660,12 +1660,10 @@ class NetworkTrainer:
                     global_step += 1
 
                     optimizer_eval_fn()
-                    self.sample_images(
-                        accelerator, args, None, global_step, accelerator.device, vae, tokenizers, text_encoder, unet
-                    )
-                    progress_bar.unpause()
 
                     # 指定ステップごとにモデルを保存
+                    # Saving runs before sampling: sampling allocates far more VRAM than the save, so an
+                    # OOM there must not cost the checkpoint for the step that already finished.
                     if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
                         accelerator.wait_for_everyone()
                         if accelerator.is_main_process:
@@ -1687,6 +1685,11 @@ class NetworkTrainer:
                             if remove_step_no is not None:
                                 remove_ckpt_name = checkpoint_io.get_step_ckpt_name(args, "." + args.save_model_as, remove_step_no)
                                 self._remove_model(args=args, accelerator=accelerator, old_ckpt_name=remove_ckpt_name)
+
+                    self.sample_images(
+                        accelerator, args, None, global_step, accelerator.device, vae, tokenizers, text_encoder, unet
+                    )
+                    progress_bar.unpause()
                     optimizer_train_fn()
 
                 current_loss = loss.detach().item()

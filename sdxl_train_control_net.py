@@ -575,20 +575,9 @@ def train(args):
                 progress_bar.update(1)
                 global_step += 1
 
-                sdxl_train_util.sample_images(
-                    accelerator,
-                    args,
-                    None,
-                    global_step,
-                    accelerator.device,
-                    vae,
-                    [tokenizer1, tokenizer2],
-                    [text_encoder1, text_encoder2, unwrap_model(text_encoder2)],
-                    unet,
-                    controlnet=control_net,
-                )
-
                 # 指定ステップごとにモデルを保存
+                # Saving runs before sampling: sampling allocates far more VRAM than the save, so an
+                # OOM there must not cost the checkpoint for the step that already finished.
                 if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
@@ -602,6 +591,19 @@ def train(args):
                         if remove_step_no is not None:
                             remove_ckpt_name = checkpoint_io.get_step_ckpt_name(args, "." + args.save_model_as, remove_step_no)
                             remove_model(remove_ckpt_name)
+
+                sdxl_train_util.sample_images(
+                    accelerator,
+                    args,
+                    None,
+                    global_step,
+                    accelerator.device,
+                    vae,
+                    [tokenizer1, tokenizer2],
+                    [text_encoder1, text_encoder2, unwrap_model(text_encoder2)],
+                    unet,
+                    controlnet=control_net,
+                )
 
             current_loss = loss.detach().item()
             loss_recorder.add(epoch=epoch, step=step, loss=current_loss)

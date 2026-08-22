@@ -862,9 +862,11 @@ def train(args):
                 progress_bar.update(1)
                 global_step += 1
                 optimizer_eval_fn()
-                _sample_images(None, global_step)
+                # Saving runs before sampling: sampling allocates far more VRAM than the save, so an
+                # OOM there must not cost the checkpoint for the step that already finished.
                 if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
                     _save_step(global_step, epoch)
+                _sample_images(None, global_step)
                 optimizer_train_fn()
 
             current_loss = loss.detach().item()

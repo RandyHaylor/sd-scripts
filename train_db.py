@@ -444,11 +444,9 @@ def train(args):
                 progress_bar.update(1)
                 global_step += 1
 
-                sampling.sample_images(
-                    accelerator, args, None, global_step, accelerator.device, vae, tokenize_strategy.tokenizer, text_encoder, unet
-                )
-
                 # 指定ステップごとにモデルを保存
+                # Saving runs before sampling: sampling allocates far more VRAM than the save, so an
+                # OOM there must not cost the checkpoint for the step that already finished.
                 if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
@@ -468,6 +466,10 @@ def train(args):
                             accelerator.unwrap_model(unet),
                             vae,
                         )
+
+                sampling.sample_images(
+                    accelerator, args, None, global_step, accelerator.device, vae, tokenize_strategy.tokenizer, text_encoder, unet
+                )
 
             current_loss = loss.detach().item()
             if len(accelerator.trackers) > 0:
